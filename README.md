@@ -1,4 +1,4 @@
-# K2-OpenHost T113 bootstrap (slot B)
+# K2-OpenHost T113 bootstrap
 
 **English** · [Italiano](README.it.md)
 
@@ -8,6 +8,19 @@
 > Read the [disclaimer and hardware limitations](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/en/DISCLAIMER.md) before using this.
 
 > **Status: built and tested offline, not yet booted on a printer.** Every piece below was checked on the reference CM5 (builds, file-by-file comparisons, the printer's own ARM binaries and Python in a chroot, real downloads from Creality and GitHub). Writing slot B, booting it and flashing MCUs have not run on hardware yet.
+
+> [!IMPORTANT]
+> **Firmware version.** This work was prepared and tested on the K2 Pro stock firmware **1.1.0.94**, the version on the reference printer. Newer Creality releases are accepted: slot B is built from them only when the boot scripts it changes are identical to the reviewed ones (true for 1.1.7.0), and the installer warns and asks for confirmation. **On any firmware other than 1.1.0.94, the correct operation of the bootstrap and of the T113 USB gadget (OTG) mode is not guaranteed.**
+
+This repository is part of [K2-OpenHost](https://github.com/MzTechnology97/K2-OpenHost):
+
+| Repository | Role |
+| --- | --- |
+| **k2-openhost-t113-bootstrap** (this one) | The printer side: the slot B system for the T113, its installer, `k2oh-slot`, `k2oh-setup`, `k2oh-mcu-fw`. |
+| [k2-openhost-installer-helper](https://github.com/MzTechnology97/k2-openhost-installer-helper) | The external host. Its menu (T113 section) clones this repository and runs the whole bootstrap over SSH. |
+| [kalico-k2pro](https://github.com/MzTechnology97/kalico-k2pro) | Kalico for the K2 Pro on the external host. |
+| [k2-pro-custom-firmware](https://github.com/MzTechnology97/k2-pro-custom-firmware) | Fork of Jacob10383's K2 firmware: K2 extras source and history; links here for the OpenHost T113 side. |
+| [k2-openhost-firmware-tools](https://github.com/MzTechnology97/k2-openhost-firmware-tools) | Peripheral firmware research and read-only probes (protocols, `cfs_update.json` format). |
 
 This turns the printer's T113 board into a ready K2-OpenHost bridge: USB gadget with the three K2 buses, HelixScreen on the printer screen talking to Moonraker on your external host, and a manual tool for Creality MCU, motor and CFS firmware updates. It goes into **slot B**. **Slot A**, the system the printer runs today, is never written and stays one command or one power cycle away.
 
@@ -39,7 +52,7 @@ The T113 has two system slots: two kernel partitions (`bootA`, `bootB`) and two 
                                                                         writable layer
 ```
 
-Slot B is the **same stock Creality system that slot A runs (1.1.0.94)**. It is downloaded from Creality's CDN on your host and changed only where K2-OpenHost needs it. No Creality file is redistributed by this project. Slot B keeps its writable layer in `/mnt/UDISK/.k2openhost/overlay`, so it never mounts, checks or formats slot A's `rootfs_data`, and it never formats, checks or wipes UDISK.
+Slot B is a **stock Creality system**: by default the same release slot A runs, otherwise the latest in Creality's index or one you choose. It is downloaded from Creality's CDN on your host and changed only where K2-OpenHost needs it. No Creality file is redistributed by this project. Slot B keeps its writable layer in `/mnt/UDISK/.k2openhost/overlay`, so it never mounts, checks or formats slot A's `rootfs_data`, and it never formats, checks or wipes UDISK.
 
 The whole install runs from the external host (`helper.sh`, menu **T113**), over SSH to the printer:
 
@@ -47,7 +60,7 @@ The whole install runs from the external host (`helper.sh`, menu **T113**), over
 external host (helper.sh)                              printer T113, running slot A
  1. asks the printer IP, finds its own IP
  2. checks slot A over SSH (read-only)  ──────────────▶ slot, U-Boot env, version
- 3. downloads Creality OTA 1.1.0.94, checks MD5
+ 3. downloads the Creality OTA (slot A's release), checks MD5
  4. builds bootB.img + rootfsB.squashfs
  5. downloads HelixScreen for the K2
  6. uploads everything, checks SHA-256  ──────────────▶ /mnt/UDISK/k2oh-slotb
@@ -62,7 +75,7 @@ external host (helper.sh)                              printer T113, running slo
 
 | What | Detail |
 | --- | --- |
-| Printer | **Creality K2 Pro only** (Creality model `F012`, board `CR0CN200400C10`, checked on the printer), slot A on stock firmware **1.1.0.94** (the release this build is validated against), root SSH enabled (stock password `creality_2024`). |
+| Printer | **Creality K2 Pro only** (Creality model `F012`, board `CR0CN200400C10`, checked on the printer), slot A on stock firmware (prepared and tested on **1.1.0.94**; newer releases accepted with a warning, not guaranteed), root SSH enabled (stock password `creality_2024`). |
 | Network | Printer and host on the same network (Ethernet or Wi-Fi) for the install. Afterwards HelixScreen uses the network to reach Moonraker. |
 | External host | Installed with this helper (Kalico, Moonraker, Mainsail), Debian-based, internet access, about 1 GB free. |
 | Cable | The printer's service Micro-USB port to a USB port of the host. |
@@ -88,18 +101,19 @@ external host (helper.sh)                              printer T113, running slo
 5. The helper **checks the printer** (read-only):
    - it must be a **Creality K2 Pro**: model `F012` and board `CR0CN200400C10`, read from the printer itself;
    - slot A must be the running slot, and the boot environment must point at it;
-   - slot A's firmware must be 1.1.0.94.
+   - slot A's firmware release is read and shown.
 
    Anything else stops the install before anything is written. `install-slot-b.sh` repeats the same checks on the printer, and `k2oh-mcu-fw` refuses to run on any other model.
-6. It installs `fakeroot` and `squashfs-tools` on the host (sudo), **downloads Creality's OTA 1.1.0.94** (130 MB) from Creality's CDN, checks kernel and rootfs against the image's own MD5 list, and **builds slot B**. The build stops if any expected change is missing.
-7. Answer **yes** to install HelixScreen (recommended): the helper downloads the latest K2 release from GitHub.
-8. The files are **uploaded** to `/mnt/UDISK/k2oh-slotb` on the printer and checked by SHA-256.
-9. `install-slot-b.sh --check` runs on the printer: nothing is written yet.
-10. **Confirm** to write slot B. The printer saves the U-Boot environment and the old slot B to `/mnt/UDISK/.k2openhost/backup/<date>/`, writes `bootB` and `rootfsB`, reads them back, and prepares slot B's writable layer:
+6. It proposes the **Creality release to build slot B from**: slot A's release when Creality still lists it, otherwise the latest; you can type another one. A release other than 1.1.0.94 shows a warning (bootstrap and OTG mode not guaranteed) and needs confirmation. A release different from slot A's means each slot reflashes the boards to its own files when it boots.
+7. It installs `fakeroot` and `squashfs-tools` on the host (sudo), clones this repository, **downloads that Creality OTA** (130–145 MB) from Creality's CDN, checks kernel and rootfs against the image's own MD5 list, and **builds slot B**. The build stops if any expected change is missing or if the stock boot scripts slot B changes differ from the reviewed ones.
+8. Answer **yes** to install HelixScreen (recommended): the helper downloads the latest K2 release from GitHub.
+9. The files are **uploaded** to `/mnt/UDISK/k2oh-slotb` on the printer and checked by SHA-256.
+10. `install-slot-b.sh --check` runs on the printer: nothing is written yet.
+11. **Confirm** to write slot B. The printer saves the U-Boot environment and the old slot B to `/mnt/UDISK/.k2openhost/backup/<date>/`, writes `bootB` and `rootfsB`, reads them back, and prepares slot B's writable layer:
     - slot A's SSH `authorized_keys` and saved Wi-Fi networks are copied;
     - the host IP is saved in `/mnt/UDISK/.k2openhost/k2openhost.conf`;
     - the HelixScreen archive is kept for the first boot.
-11. Slot A still boots by default. Continue with the trial boot below.
+12. Slot A still boots by default. Continue with the trial boot below.
 
 ## Trial boot, keep, go back
 
@@ -140,6 +154,16 @@ Slot B's root password is the stock one (`creality_2024`) even if you changed sl
 ## Updating MCU, motor and CFS firmware
 
 Firmware updates are **manual on purpose**. Run them from slot B, with the printer idle.
+
+### The short way: latest release
+
+From the host: menu **30) Update MCU firmware** (`./helper.sh t113 mcu-fw update`), or on the printer:
+
+```sh
+k2oh-mcu-fw update          # add --cfs to include the CFS units
+```
+
+It looks up the **latest** release in Creality's index, downloads it (only the firmware files are kept), stages it in slot B, shows which boards would change and asks **"Flash the boards now?"**. Answer no and nothing is flashed now; the staged files are flashed at slot B's next boot, or with `k2oh-mcu-fw apply`, or dropped with `k2oh-mcu-fw unstage`. Answer yes and it runs `apply` with all its checks (stop Klipper on the host first).
 
 ### What gets updated
 
@@ -208,7 +232,7 @@ On the printer (`ssh root@<printer>`), or from the host with `./helper.sh t113 m
 
    `k2oh-mcu-fw unstage` puts slot B's original files back.
 
-**Note:** slot A reflashes its own 1.1.0.94 files at its next boot, because the stock script flashes on any version difference. Booting slot A after an update downgrades the boards again.
+**Note:** slot A reflashes its own release's files at its next boot, because the stock script flashes on any version difference. Booting slot A after an update downgrades the boards again.
 
 ### How the CFS pass works
 
@@ -263,11 +287,11 @@ What Creality's tools lack: they are closed binaries, they log less, and they re
 
 | File | Runs on | Does |
 | --- | --- | --- |
-| `build-slot-b.sh` | host | Builds `bootB.img` and `rootfsB.squashfs` from the stock `kernel` and `rootfs`; refuses unknown bases (`--allow-other-base` to override). |
-| `fetch-stock-ota.py` | host | Downloads a stock OTA from Creality, checks MD5, keeps `kernel` and `rootfs`. |
+| `build-slot-b.sh` | host | Builds `bootB.img` and `rootfsB.squashfs` from the stock `kernel` and `rootfs`; warns on releases other than 1.1.0.94 and refuses when the stock boot scripts it changes differ (`--force-preinit` to override after a review). |
+| `fetch-stock-ota.py` | host | Lists Creality's releases, downloads one (or the latest), checks MD5, keeps `kernel` and `rootfs`. |
 | `install-slot-b.sh` | printer, slot A | `--check` / write slot B, backups, setup files. |
 | `rootfs/` | — | Files added to the stock root filesystem. |
-| `../../scripts/t113.sh` | host | The helper's T113 commands. |
+| [`scripts/t113.sh`](https://github.com/MzTechnology97/k2-openhost-installer-helper/blob/main/scripts/t113.sh) (installer helper) | host | The helper's T113 commands; clones this repository to `~/k2-openhost-t113-bootstrap`. |
 
 ### Paths on the printer
 
@@ -283,8 +307,9 @@ What Creality's tools lack: they are closed binaries, they log less, and they re
 ### Building by hand
 
 ```bash
-python3 fetch-stock-ota.py 1.1.0.94 stock
-./build-slot-b.sh --kernel stock/kernel --rootfs stock/rootfs --out out
+python3 fetch-stock-ota.py --list                 # releases in Creality's index
+python3 fetch-stock-ota.py 1.1.0.94 stock         # or "latest"
+./build-slot-b.sh --kernel stock/kernel --rootfs stock/rootfs --base-version 1.1.0.94 --out out
 ```
 
 `build-slot-b.sh` needs `fakeroot` and `squashfs-tools`. `apt-get download squashfs-tools && dpkg -x squashfs-tools_*.deb tools`, then `--tools tools/usr/bin`, works without root.
@@ -295,6 +320,7 @@ python3 fetch-stock-ota.py 1.1.0.94 stock
 | --- | --- |
 | Slot B file list vs stock squashfs | only the intended changes; all other files identical, permissions included |
 | Stock OTA download from Creality's CDN | 1.1.0.94 kernel/rootfs MD5 identical to the validated base |
+| Newer release 1.1.7.0 | boot scripts slot B changes identical to 1.1.0.94, same services, kernel 5.4.61 with gadget serial and OTG manager; slot B builds with the "not tested" warning. Not booted. |
 | Scripts with the printer's own BusyBox and Python 3.9 (chroot) | syntax checks pass |
 | Bridge with pseudo-terminals | 10 KB binary both ways, 0 CPU idle, clean stop |
 | `k2oh-mcu-fw` extraction vs `unsquashfs` | 15 firmware files byte-identical |
