@@ -1,0 +1,32 @@
+#!/bin/sh /etc/rc.common
+# K2-OpenHost: Wi-Fi without Creality's wifi-server (part of the disabled UI
+# apps). Same wpa_supplicant and udhcpc invocations as the stock system, so
+# saved networks (copied from slot A at install) and HelixScreen's Wi-Fi
+# settings keep working. Ethernet is handled by netifd as usual.
+
+START=22
+STOP=89
+USE_PROCD=1
+
+WPA_DIR=/etc/wifi/wpa_supplicant
+
+start_service() {
+	local n
+	for n in 1 2 3 4 5 6 7 8 9 10; do
+		[ -d /sys/class/net/wlan0 ] && break
+		sleep 1
+	done
+	[ -d /sys/class/net/wlan0 ] || return 0
+
+	procd_open_instance wpa
+	procd_set_param command /usr/sbin/wpa_supplicant -iwlan0 -Dnl80211 \
+		-c "$WPA_DIR/wpa_supplicant.conf" -m "$WPA_DIR/wpa_supplicant_p2p.conf" \
+		-O "$WPA_DIR/sockets"
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+
+	procd_open_instance dhcp
+	procd_set_param command /sbin/udhcpc -f -i wlan0 -S -t 5 -T 7
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}

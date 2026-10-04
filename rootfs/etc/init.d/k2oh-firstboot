@@ -1,0 +1,11 @@
+#!/bin/sh /etc/rc.common
+# K2-OpenHost: run k2oh-setup once on the first boot of slot B (HelixScreen
+# install and external host address). Log: /mnt/UDISK/.k2openhost/setup.log
+
+START=99
+
+start() {
+	[ -f /mnt/UDISK/.k2openhost/k2openhost.conf ] || return 0
+	[ -f /mnt/UDISK/.k2openhost/setup.done ] && return 0
+	( /usr/sbin/k2oh-setup >> /mnt/UDISK/.k2openhost/setup.log 2>&1 ) &
+}

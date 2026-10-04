@@ -4,8 +4,13 @@
 # Run as root on the printer, in the directory build-slot-b.sh produced
 # (bootB.img, rootfsB.squashfs, SHA256SUMS, k2oh-slot, this script):
 #
-#   sh install-slot-b.sh            check everything, write slot B, verify it
-#   sh install-slot-b.sh --check    checks only, writes nothing
+#   sh install-slot-b.sh --host IP          check, write slot B, verify it
+#   sh install-slot-b.sh --check --host IP  checks only, writes nothing
+#
+# --host is the external Linux host (Kalico/Moonraker). It is saved in
+# /mnt/UDISK/.k2openhost/k2openhost.conf; the first boot of slot B installs
+# HelixScreen from helixscreen-k2-*.tar.gz + helixscreen-install.sh (when
+# they are in this directory) and points it at that host.
 #
 # Slot A (bootA, rootfsA, rootfs_data) is never written. The previous slot B
 # content and the U-Boot environment are saved to /mnt/UDISK/.k2openhost/backup.
@@ -17,10 +22,19 @@ set -e
 
 K2OH_DIR=/mnt/UDISK/.k2openhost
 STOCK_VERSION="1.1.0.94"
+K2_PRO_MODEL="F012"
+K2_PRO_BOARD="CR0CN200400C10"
 STOCK_KERNEL="#5 SMP PREEMPT Fri Sep 26 16:07:42 CST 2025"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CHECK_ONLY=0
-[ "$1" = "--check" ] && CHECK_ONLY=1
+HOST_IP=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--check) CHECK_ONLY=1; shift ;;
+	--host) HOST_IP="$2"; shift 2 ;;
+	*) echo "usage: sh install-slot-b.sh [--check] --host <external host IP>" >&2; exit 2 ;;
+	esac
+done
 
 say() { printf '\033[1;36m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mk2oh: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -29,6 +43,9 @@ part_bytes() { echo $(( $(cat "/sys/class/block/$(basename "$(readlink -f "$1")"
 
 say "Checking the printer"
 [ "$(id -u)" = "0" ] || die "run as root"
+case "$HOST_IP" in
+""|*[!0-9A-Za-z.-]*) die "give the external host with --host <IP or hostname>" ;;
+esac
 case " $(cat /proc/cmdline) " in
 *" root=/dev/mmcblk0p6 "*) ;;
 *) die "this must run from slot A (root=/dev/mmcblk0p6)" ;;
@@ -38,6 +55,7 @@ mkdir -p /var/lock
 	|| die "the U-Boot environment does not point at slot A"
 grep -q "\"sys_version\":\"$STOCK_VERSION\"" /mnt/UDISK/creality/userdata/config/system_version.json 2>/dev/null \
 	|| die "slot A is not the stock $STOCK_VERSION firmware this image is built from"
+[ "$(get_sn_mac.sh model 2>/dev/null)" = "$K2_PRO_MODEL" ] 	&& [ "$(get_sn_mac.sh board 2>/dev/null)" = "$K2_PRO_BOARD" ] 	&& [ "$(fw_printenv -n board 2>/dev/null)" = "$K2_PRO_BOARD" ] 	|| die "this is not a Creality K2 Pro (model $K2_PRO_MODEL, board $K2_PRO_BOARD)"
 case "$(uname -v)" in
 "$STOCK_KERNEL") ;;
 *) die "the running kernel is not the stock $STOCK_VERSION kernel ($(uname -v))" ;;
@@ -101,8 +119,35 @@ if [ -s /etc/dropbear/authorized_keys ]; then
 	chmod 0600 "$upper/etc/dropbear/authorized_keys"
 	echo "  copied slot A's SSH authorized_keys to slot B"
 fi
+if grep -q "network=" /etc/wifi/wpa_supplicant/wpa_supplicant.conf 2>/dev/null; then
+	mkdir -p "$upper/etc/wifi/wpa_supplicant"
+	cp /etc/wifi/wpa_supplicant/wpa_supplicant.conf "$upper/etc/wifi/wpa_supplicant/wpa_supplicant.conf"
+	chmod 0600 "$upper/etc/wifi/wpa_supplicant/wpa_supplicant.conf"
+	echo "  copied slot A's saved Wi-Fi networks to slot B"
+fi
 cp "$HERE/k2oh-slot" "$K2OH_DIR/bin/k2oh-slot"
 chmod 0755 "$K2OH_DIR/bin/k2oh-slot"
+
+say "Saving the slot B setup (external host $HOST_IP)"
+mkdir -p "$K2OH_DIR/setup"
+helix_archive="" helix_installer=""
+for f in "$HERE"/helixscreen-k2-*.tar.gz; do
+	[ -f "$f" ] || continue
+	cp "$f" "$K2OH_DIR/setup/" && helix_archive="$K2OH_DIR/setup/$(basename "$f")"
+done
+if [ -f "$HERE/helixscreen-install.sh" ]; then
+	cp "$HERE/helixscreen-install.sh" "$K2OH_DIR/setup/" && helix_installer="$K2OH_DIR/setup/helixscreen-install.sh"
+fi
+cat > "$K2OH_DIR/k2openhost.conf" <<EOF
+# K2-OpenHost slot B configuration (install-slot-b.sh, k2oh-setup)
+HOST_IP=$HOST_IP
+MOONRAKER_PORT=7125
+MOONRAKER_URL=http://$HOST_IP:7125
+HELIX_ARCHIVE=$helix_archive
+HELIX_INSTALLER=$helix_installer
+EOF
+rm -f "$K2OH_DIR/setup.done"
+[ -n "$helix_archive" ] && echo "  HelixScreen is installed at the first boot of slot B" 	|| echo "  no HelixScreen archive here: slot B starts without a screen UI"
 sync
 
 say "Slot B is installed"
