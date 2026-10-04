@@ -40,13 +40,12 @@ k2oh_find_partition() {
 	return 1
 }
 
+# UDISK belongs to slot A as well: slot B only mounts it, never checks,
+# repairs or formats it.
 k2oh_mount_udisk() {
 	local dev
 	dev=$(k2oh_find_partition UDISK) || return 1
 	mkdir -p /mnt/UDISK
-	mount -t ext4 -o rw,noatime "$dev" /mnt/UDISK 2>/dev/null && return 0
-	k2oh_log "UDISK did not mount, checking it"
-	e2fsck -y "$dev"
 	mount -t ext4 -o rw,noatime "$dev" /mnt/UDISK
 }
 
