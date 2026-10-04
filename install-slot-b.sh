@@ -21,10 +21,9 @@
 set -e
 
 K2OH_DIR=/mnt/UDISK/.k2openhost
-STOCK_VERSION="1.1.0.94"
+TESTED_VERSION="1.1.0.94"
 K2_PRO_MODEL="F012"
 K2_PRO_BOARD="CR0CN200400C10"
-STOCK_KERNEL="#5 SMP PREEMPT Fri Sep 26 16:07:42 CST 2025"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CHECK_ONLY=0
 HOST_IP=""
@@ -53,13 +52,20 @@ esac
 mkdir -p /var/lock
 [ "$(fw_printenv -n boot_partition)/$(fw_printenv -n root_partition)" = "bootA/rootfsA" ] \
 	|| die "the U-Boot environment does not point at slot A"
-grep -q "\"sys_version\":\"$STOCK_VERSION\"" /mnt/UDISK/creality/userdata/config/system_version.json 2>/dev/null \
-	|| die "slot A is not the stock $STOCK_VERSION firmware this image is built from"
-[ "$(get_sn_mac.sh model 2>/dev/null)" = "$K2_PRO_MODEL" ] 	&& [ "$(get_sn_mac.sh board 2>/dev/null)" = "$K2_PRO_BOARD" ] 	&& [ "$(fw_printenv -n board 2>/dev/null)" = "$K2_PRO_BOARD" ] 	|| die "this is not a Creality K2 Pro (model $K2_PRO_MODEL, board $K2_PRO_BOARD)"
-case "$(uname -v)" in
-"$STOCK_KERNEL") ;;
-*) die "the running kernel is not the stock $STOCK_VERSION kernel ($(uname -v))" ;;
-esac
+[ "$(get_sn_mac.sh model 2>/dev/null)" = "$K2_PRO_MODEL" ] \
+	&& [ "$(get_sn_mac.sh board 2>/dev/null)" = "$K2_PRO_BOARD" ] \
+	&& [ "$(fw_printenv -n board 2>/dev/null)" = "$K2_PRO_BOARD" ] \
+	|| die "this is not a Creality K2 Pro (model $K2_PRO_MODEL, board $K2_PRO_BOARD)"
+slot_a_version=$(sed -n 's/.*"sys_version":"\([^"]*\)".*/\1/p' /mnt/UDISK/creality/userdata/config/system_version.json 2>/dev/null)
+slot_b_version=$(sed -n 's/^base_version=//p' "$HERE/manifest.txt" 2>/dev/null)
+echo "  Creality K2 Pro, slot A firmware ${slot_a_version:-unknown}, slot B image built from ${slot_b_version:-unknown}"
+if [ "$slot_a_version" != "$TESTED_VERSION" ] || [ "$slot_b_version" != "$TESTED_VERSION" ]; then
+	printf '\033[1;33m  WARNING: this work was prepared and tested on firmware %s only.\n' "$TESTED_VERSION"
+	printf '  On other releases the bootstrap and the T113 USB gadget (OTG) mode are not guaranteed.\033[0m\n'
+fi
+if [ -n "$slot_a_version" ] && [ -n "$slot_b_version" ] && [ "$slot_a_version" != "$slot_b_version" ]; then
+	echo "  Note: the slots carry different MCU firmware files; each slot flashes its own at boot."
+fi
 grep -q " /mnt/UDISK " /proc/mounts || die "/mnt/UDISK is not mounted"
 for dev in bootB rootfsB env env-redund; do
 	[ -e "/dev/by-name/$dev" ] || die "missing /dev/by-name/$dev"

@@ -1,6 +1,9 @@
 #!/usr/bin/python3
 """Creality MCU firmware for K2-OpenHost slot B.
 
+    k2oh-mcu-fw update [--cfs]        download the latest release, stage it,
+                                      show what changes, flash only if you
+                                      confirm (same checks as apply)
     k2oh-mcu-fw list                  Creality OTA releases for this printer
     k2oh-mcu-fw status                running MCU versions and what would change
     k2oh-mcu-fw download [VERSION]    fetch a release (default: latest), keep
@@ -393,6 +396,18 @@ def load_manifest(version):
     return manifest
 
 
+def slot_b_base():
+    """Stock release slot B was built from (/etc/k2openhost-release)."""
+    try:
+        with open("/etc/k2openhost-release") as f:
+            for line in f:
+                if line.startswith("base_version="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
+
+
 def read_staged():
     try:
         with open(STAGED_FILE) as f:
@@ -458,7 +473,8 @@ def cmd_status(_args):
         name = os.path.basename(rel)
         if name.endswith(".bin") and "-" in name:
             by_hw.setdefault(name.split("-")[0], []).append(name[:-4])
-    print("Firmware files : %s (%s)" % (read_staged() or "slot B original", os.path.join(FW_ROOT, model)))
+    original = "slot B original (stock %s)" % slot_b_base()
+    print("Firmware files : %s (%s)" % (read_staged() or original, os.path.join(FW_ROOT, model)))
     boards = board_versions()
     if not boards:
         print("No board versions yet (/tmp/.mcu_version is written by mcu_update at boot).")
@@ -665,6 +681,35 @@ def cmd_apply(args):
     print("Start Klipper on the external host again (FIRMWARE_RESTART or systemctl start klipper).")
 
 
+def cmd_update(args):
+    """Latest Creality release: download, stage, show, flash on request."""
+    require_slot_b()
+    releases = search_releases(board_name())
+    if not releases:
+        die("no releases found in Creality's index")
+    latest = releases[-1]["version"]
+    print("Latest Creality release: %s" % latest)
+    args.version = latest
+    cmd_download(args)
+    if read_staged() != latest:
+        cmd_stage(args)
+    else:
+        print("%s is already staged" % latest)
+    cmd_status(args)
+    if args.yes:
+        answer = "y"
+    else:
+        try:
+            answer = input("Flash the boards now? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+    if answer not in ("y", "yes", "s", "si"):
+        print("Not flashed. Slot B flashes the staged files at its next boot; 'k2oh-mcu-fw apply'")
+        print("flashes them now, 'k2oh-mcu-fw unstage' goes back to slot B's original files.")
+        return
+    cmd_apply(args)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="k2oh-mcu-fw", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="cmd")
@@ -675,16 +720,18 @@ def main():
     p = sub.add_parser("stage")
     p.add_argument("version")
     sub.add_parser("unstage")
-    p = sub.add_parser("apply")
-    p.add_argument("--host-stopped", action="store_true", help="Klipper on the external host is stopped")
-    p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
-    p.add_argument("--moonraker", metavar="URL", help="external host Moonraker, e.g. http://10.10.1.97:7125")
-    p.add_argument("--cfs", action="store_true", help="also flash the CFS units (second pass)")
+    for name in ("apply", "update"):
+        p = sub.add_parser(name)
+        p.add_argument("--host-stopped", action="store_true", help="Klipper on the external host is stopped")
+        p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+        p.add_argument("--moonraker", metavar="URL", help="external host Moonraker, e.g. http://10.10.1.97:7125")
+        p.add_argument("--cfs", action="store_true", help="also flash the CFS units (second pass)")
     args = parser.parse_args()
-    if os.geteuid() != 0 and args.cmd in ("download", "stage", "unstage", "apply"):
+    if os.geteuid() != 0 and args.cmd in ("download", "stage", "unstage", "apply", "update"):
         die("run as root")
     commands = {"list": cmd_list, "status": cmd_status, "download": cmd_download,
-                "stage": cmd_stage, "unstage": cmd_unstage, "apply": cmd_apply}
+                "stage": cmd_stage, "unstage": cmd_unstage, "apply": cmd_apply,
+                "update": cmd_update}
     if not args.cmd:
         parser.print_help()
         return
