@@ -1,0 +1,100 @@
+#!/bin/sh
+# K2-OpenHost slot switch for the K2 Pro T113 (stock U-Boot A/B slots).
+#
+# Slot A keeps the printer's current system. Slot B holds the K2-OpenHost
+# system written by install-slot-b.sh. Only boot_partition/root_partition in
+# the U-Boot environment change, the same variables a Creality OTA update sets.
+#
+#   k2oh-slot status        active slot, next boot, trial flag
+#   k2oh-slot boot-b        trial boot of slot B at the next reboot
+#   k2oh-slot commit        on slot B: keep booting slot B
+#   k2oh-slot boot-a        boot slot A at the next reboot
+
+set -e
+
+die() { echo "k2oh-slot: $*" >&2; exit 1; }
+
+[ "$(id -u)" = "0" ] || die "run as root"
+mkdir -p /var/lock
+
+getenv() { fw_printenv -n "$1" 2>/dev/null || true; }
+
+setenv_script() {
+	local script=/tmp/k2oh-slot-env.$$
+	cat > "$script"
+	fw_setenv -s "$script" || { rm -f "$script"; die "fw_setenv failed"; }
+	rm -f "$script"
+}
+
+active_slot() {
+	case " $(cat /proc/cmdline) " in
+	*" root=/dev/mmcblk0p6 "*) echo A ;;
+	*" root=/dev/mmcblk0p7 "*) echo B ;;
+	*) echo "?" ;;
+	esac
+}
+
+next_slot() {
+	case "$(getenv boot_partition)/$(getenv root_partition)" in
+	bootA/rootfsA) echo A ;;
+	bootB/rootfsB) echo B ;;
+	*) echo "mismatch ($(getenv boot_partition)/$(getenv root_partition))" ;;
+	esac
+}
+
+slot_b_present() {
+	[ "$(head -c 8 /dev/by-name/bootB 2>/dev/null)" = "ANDROID!" ] || return 1
+	[ "$(head -c 4 /dev/by-name/rootfsB 2>/dev/null)" = "hsqs" ] || return 1
+}
+
+cmd_status() {
+	echo "Active slot : $(active_slot)"
+	echo "Next boot   : $(next_slot)"
+	echo "Trial flag  : $([ "$(getenv k2oh_trial)" = "1" ] && echo "set (slot B boots once)" || echo "not set")"
+	if [ -f /etc/k2openhost-release ]; then
+		echo "Running     : K2-OpenHost slot B"
+		sed 's/^/  /' /etc/k2openhost-release
+	else
+		echo "Running     : stock system ($(cat /etc/openwrt_version 2>/dev/null))"
+	fi
+	slot_b_present && echo "Slot B      : K2-OpenHost image present" || echo "Slot B      : no K2-OpenHost image found"
+}
+
+cmd_boot_b() {
+	slot_b_present || die "slot B has no K2-OpenHost image; run install-slot-b.sh first"
+	setenv_script <<EOF
+boot_partition bootB
+root_partition rootfsB
+k2oh_trial 1
+EOF
+	echo "Slot B boots at the next reboot (trial). Run 'reboot'."
+	echo "If slot B does not come up, power cycle the printer: it returns to slot A."
+	echo "Once slot B works, run 'k2oh-slot commit' on it to keep it."
+}
+
+cmd_commit() {
+	[ "$(active_slot)" = "B" ] || die "commit runs on slot B"
+	setenv_script <<EOF
+boot_partition bootB
+root_partition rootfsB
+k2oh_trial
+EOF
+	echo "Slot B is now the default. 'k2oh-slot boot-a' returns to slot A."
+}
+
+cmd_boot_a() {
+	setenv_script <<EOF
+boot_partition bootA
+root_partition rootfsA
+k2oh_trial
+EOF
+	echo "Slot A boots at the next reboot. Run 'reboot'."
+}
+
+case "${1:-status}" in
+status) cmd_status ;;
+boot-b) cmd_boot_b ;;
+commit) cmd_commit ;;
+boot-a) cmd_boot_a ;;
+*) die "usage: k2oh-slot [status|boot-b|commit|boot-a]" ;;
+esac

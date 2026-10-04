@@ -1,0 +1,98 @@
+#!/usr/bin/python3
+"""Byte-transparent bridge between a USB gadget serial port and a K2 UART.
+
+    k2oh-bridge /dev/ttyGS0 /dev/ttyS2
+
+One process per channel: a second owner on the same UART corrupts the
+traffic (seen on RS-485 during the Cartographer multiplexing test). This is
+the bridge validated on the K2 Pro (Main, Nozzle and RS-485 at 230400 8N1),
+with an idle wait on empty reads and a non-zero exit on I/O errors so procd
+restarts it.
+"""
+
+import os
+import select
+import signal
+import sys
+import termios
+import time
+
+BAUD = termios.B230400
+running = True
+
+
+def stop_handler(signum, frame):
+    global running
+    running = False
+
+
+def configure(fd, baud=None):
+    a = termios.tcgetattr(fd)
+    a[0] = 0
+    a[1] = 0
+    a[3] = 0
+    a[2] &= ~(termios.CSIZE | termios.PARENB | termios.CSTOPB)
+    if hasattr(termios, "CRTSCTS"):
+        a[2] &= ~termios.CRTSCTS
+    a[2] |= termios.CS8 | termios.CREAD | termios.CLOCAL
+    a[6][termios.VMIN] = 0
+    a[6][termios.VTIME] = 0
+    if baud is not None:
+        a[4] = baud
+        a[5] = baud
+    termios.tcsetattr(fd, termios.TCSANOW, a)
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view and running:
+        try:
+            n = os.write(fd, view)
+            view = view[n:]
+        except BlockingIOError:
+            select.select([], [fd], [], 1)
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: k2oh-bridge /dev/ttyGSx /dev/ttySx", file=sys.stderr)
+        return 2
+    usb_path, uart_path = sys.argv[1], sys.argv[2]
+    signal.signal(signal.SIGINT, stop_handler)
+    signal.signal(signal.SIGTERM, stop_handler)
+
+    flags = os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK
+    usb = os.open(usb_path, flags)
+    uart = os.open(uart_path, flags)
+    configure(usb)
+    configure(uart, BAUD)
+    termios.tcflush(usb, termios.TCIOFLUSH)
+    termios.tcflush(uart, termios.TCIOFLUSH)
+    print("bridge active: %s <-> %s @ 230400" % (usb_path, uart_path), flush=True)
+
+    try:
+        while running:
+            readable, _, _ = select.select([usb, uart], [], [], 1)
+            for src in readable:
+                try:
+                    data = os.read(src, 4096)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    # The gadget side reports EOF while the host has the
+                    # port closed; wait instead of spinning.
+                    time.sleep(0.05)
+                    continue
+                write_all(uart if src == usb else usb, data)
+    except OSError as exc:
+        print("bridge error on %s <-> %s: %s" % (usb_path, uart_path, exc), file=sys.stderr, flush=True)
+        return 1
+    finally:
+        os.close(uart)
+        os.close(usb)
+    print("bridge stopped: %s <-> %s" % (usb_path, uart_path), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

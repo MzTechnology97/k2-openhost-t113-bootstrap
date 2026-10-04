@@ -1,0 +1,97 @@
+# Copyright (C) 2006 OpenWrt.org
+# Copyright (C) 2010 Vertical Communications
+#
+# K2-OpenHost slot B. Slot A keeps the rootfs_data overlay partition for
+# itself, so this system keeps its writable layer on UDISK instead, in
+# /mnt/UDISK/.k2openhost/overlay. A trial boot (k2oh_trial=1 in the U-Boot
+# environment) points the next boot back at slot A before anything else runs:
+# if slot B does not come up, a power cycle returns to slot A.
+
+K2OH_DIR=/mnt/UDISK/.k2openhost
+
+k2oh_log() {
+	echo "k2openhost: $*" > /dev/kmsg 2>/dev/null
+	echo "k2openhost: $*"
+}
+
+k2oh_trial_revert() {
+	mkdir -p /var/lock
+	[ "$(fw_printenv -n k2oh_trial 2>/dev/null)" = "1" ] || return 0
+	cat > /tmp/k2oh-env-revert <<EOF
+boot_partition bootA
+root_partition rootfsA
+k2oh_trial
+EOF
+	if fw_setenv -s /tmp/k2oh-env-revert; then
+		k2oh_log "trial boot of slot B: the next boot returns to slot A unless 'k2oh-slot commit' is run"
+	else
+		k2oh_log "trial boot of slot B: could not point the next boot back at slot A"
+	fi
+	rm -f /tmp/k2oh-env-revert
+}
+
+k2oh_find_partition() {
+	local uevent
+	for uevent in /sys/class/block/*/uevent; do
+		grep -qx "PARTNAME=$1" "$uevent" 2>/dev/null || continue
+		echo "/dev/$(sed -n 's/^DEVNAME=//p' "$uevent")"
+		return 0
+	done
+	return 1
+}
+
+k2oh_mount_udisk() {
+	local dev
+	dev=$(k2oh_find_partition UDISK) || return 1
+	mkdir -p /mnt/UDISK
+	mount -t ext4 -o rw,noatime "$dev" /mnt/UDISK 2>/dev/null && return 0
+	k2oh_log "UDISK did not mount, checking it"
+	e2fsck -y "$dev"
+	mount -t ext4 -o rw,noatime "$dev" /mnt/UDISK
+}
+
+k2oh_mount_overlay() {
+	local upper work
+	if k2oh_mount_udisk; then
+		upper=$K2OH_DIR/overlay/upper
+		work=$K2OH_DIR/overlay/work
+		mkdir -p "$upper" "$work"
+	else
+		# Keep the system reachable over SSH; changes are lost at reboot.
+		k2oh_log "UDISK unavailable, using a RAM overlay"
+		mkdir -p /tmp/k2oh-ram
+		mount -t tmpfs -o mode=0755 tmpfs /tmp/k2oh-ram
+		upper=/tmp/k2oh-ram/upper
+		work=/tmp/k2oh-ram/work
+		mkdir -p "$upper" "$work"
+	fi
+
+	mount -n -t overlay overlayfs:"$upper" -o rw,noatime,lowerdir=/,upperdir="$upper",workdir="$work" /mnt || {
+		k2oh_log "overlay mount failed, continuing on the read-only root"
+		return 1
+	}
+	mount -n /proc -o noatime,move /mnt/proc
+	pivot_root /mnt /mnt/rom
+	grep -q " /rom/mnt/UDISK " /proc/mounts && mount -n /rom/mnt/UDISK -o noatime,move /mnt/UDISK
+	mount -n /rom/dev -o noatime,move /dev
+	mount -n /rom/tmp -o noatime,move /tmp
+	mount -n /rom/sys -o noatime,move /sys
+}
+
+do_mount_root() {
+	k2oh_trial_revert
+	k2oh_mount_overlay
+
+	boot_run_hook preinit_mount_root
+	[ -f /sysupgrade.tgz ] && {
+		echo "- config restore -"
+		cp /etc/passwd /etc/group /etc/shadow /tmp
+		cd /
+		mv sysupgrade.tgz /tmp
+		tar xzf /tmp/sysupgrade.tgz
+		rm -f /tmp/sysupgrade.tgz
+		sync
+	}
+}
+
+[ "$INITRAMFS" = "1" ] || boot_hook_add preinit_main do_mount_root
