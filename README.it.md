@@ -73,6 +73,25 @@ Il `motor_updater.py` di Jacob10383 fa lo stesso in Python all'avvio, con il fir
 Conseguenze per lo slot B:
 
 - Lo slot B ha gli stessi file firmware dello slot A, quindi avviare l'uno o l'altro non riscrive nulla.
-- Passare a una nuova versione Creality vuol dire mettere i suoi `.bin` nello slot B (il suo livello scrivibile è su UDISK, quindi lo slot A non viene toccato) ed eseguire la sequenza originale con i bridge e il Klipper dell'host fermi. Ricostruire lo slot B dall'OTA più recente fa lo stesso al primo avvio.
+- Passare a una nuova versione Creality vuol dire mettere i suoi `.bin` nello slot B (il suo livello scrivibile è su UDISK, quindi lo slot A non viene toccato) ed eseguire la sequenza originale con i bridge e il Klipper dell'host fermi. Lo fa `k2oh-mcu-fw` (sotto).
 - **Lo slot A riscrive i suoi file più vecchi al suo prossimo avvio**, perché lo script originale riscrive a ogni differenza.
 - L'host esterno non può aggiornare passando dai bridge così come sono: i loader parlano a 115200, i bridge tengono le UART a 230400 e il collegamento seriale gadget non trasporta i cambi di velocità. Gli aggiornamenti si fanno sul T113.
+
+### `k2oh-mcu-fw`
+
+Gira sullo slot B, da root.
+
+| Comando | Cosa fa |
+| --- | --- |
+| `k2oh-mcu-fw list` | Elenca le versioni OTA della K2 Pro nell'indice firmware pubblico di Creality (`crealitycloud.com`, senza account e senza inviare dati della stampante). |
+| `k2oh-mcu-fw download [VERSIONE]` | Scarica una versione dal CDN Creality (di default l'ultima), controlla il filesystem di root con l'elenco MD5 contenuto nell'immagine, tiene solo `/usr/share/klipper/fw/F012` e `/usr/share/klipper/fw/cfs` in `/mnt/UDISK/.k2openhost/mcu-fw/<versione>/` con un manifest SHA-256, e cancella l'immagine. Il filesystem di root viene letto direttamente (il kernel del T113 non ha dispositivi loop), non viene montato nulla. |
+| `k2oh-mcu-fw status` | Mostra la versione di ogni scheda (dall'ultimo `mcu_update`) e il file con cui verrebbe aggiornata. |
+| `k2oh-mcu-fw stage VERSIONE` | Sostituisce i file firmware dello slot B con una versione scaricata e mostra quali file cambiano. Lo slot B li scrive al suo prossimo avvio. |
+| `k2oh-mcu-fw unstage` | Rimette i file originali dello slot B. |
+| `k2oh-mcu-fw apply` | Aggiorna subito: ferma i bridge, spegne e riaccende le MCU, esegue `mcu_update` originale, riavvia i bridge, mostra il log e le nuove versioni. |
+
+`apply` non parte se Klipper sull'host esterno è attivo. Lo verifica tramite Moonraker con `--moonraker http://<host>:7125` o con `MOONRAKER_URL=` in `/mnt/UDISK/.k2openhost/host.conf`; altrimenti serve `--host-stopped`. Chiede di scrivere `flash`. Dopo, riavvia Klipper.
+
+**Il CFS viene scaricato ma non aggiornato.** Il percorso originale aggiorna il CFS solo con `/tmp/cfs_update.json`, scritto dal server OTA di Creality (sembra elencare le unità CFS per UUID). Il formato esatto non è stato ricostruito, e tirarlo a indovinare per un'operazione di scrittura non è accettabile.
+
+Provato solo offline: l'estrazione coincide byte per byte con `unsquashfs`, e `list`, `download` (1.1.7.0 dal CDN Creality), `status`, `stage` e `unstage` sono stati eseguiti con il Python 3.9 del T113 in un chroot sul CM5. `apply` non è ancora stato eseguito su una stampante.

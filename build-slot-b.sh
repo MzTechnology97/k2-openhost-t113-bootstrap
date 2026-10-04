@@ -79,10 +79,11 @@ set -euo pipefail
 root="$1" src="$2" disabled="$3" release="$4"
 cp -a "$src/." "$root/"
 chown -R 0:0 "$root/etc/init.d/k2oh-gadget" "$root/etc/init.d/k2oh-bridge" \
-	"$root/usr/bin/k2oh-bridge" "$root/usr/sbin/k2oh-slot" \
+	"$root/usr/bin/k2oh-bridge" "$root/usr/bin/k2oh-mcu-fw" "$root/usr/sbin/k2oh-slot" \
 	"$root/usr/bin/chamber_cam_power.sh" "$root/lib/preinit/80_mount_root"
 chmod 0755 "$root/etc/init.d/k2oh-gadget" "$root/etc/init.d/k2oh-bridge" \
-	"$root/usr/bin/k2oh-bridge" "$root/usr/sbin/k2oh-slot" "$root/usr/bin/chamber_cam_power.sh"
+	"$root/usr/bin/k2oh-bridge" "$root/usr/bin/k2oh-mcu-fw" "$root/usr/sbin/k2oh-slot" \
+	"$root/usr/bin/chamber_cam_power.sh"
 chmod 0644 "$root/lib/preinit/80_mount_root"
 for svc in $disabled; do
 	rm -f "$root"/etc/rc.d/[SK][0-9][0-9]"${svc#S99}"

@@ -1,0 +1,621 @@
+#!/usr/bin/python3
+"""Creality MCU firmware for K2-OpenHost slot B.
+
+    k2oh-mcu-fw list                  Creality OTA releases for this printer
+    k2oh-mcu-fw status                running MCU versions and what would change
+    k2oh-mcu-fw download [VERSION]    fetch a release (default: latest), keep
+                                      only its MCU/motor/CFS firmware files
+    k2oh-mcu-fw stage VERSION         install a downloaded set in slot B
+    k2oh-mcu-fw unstage               go back to slot B's original files
+    k2oh-mcu-fw apply                 flash now with the stock Creality tools
+
+The OTA image is read from Creality's public firmware index and downloaded
+from its CDN. Only /usr/share/klipper/fw/<model> and /usr/share/klipper/fw/cfs
+are kept (checked against the image's own MD5 list); the image is deleted.
+
+Flashing uses Creality's own sequence: stop the bridges, power-cycle the MCU
+rail (mcu_reset.sh), run /etc/init.d/mcu_update (mcu_util + mcu_util_485),
+start the bridges again. The stock script flashes every board whose version
+differs from its file and also runs at every boot of slot B. The CFS is not
+flashed: the stock path needs /tmp/cfs_update.json, written by Creality's OTA
+server, whose content is not reproduced here. Slot A flashes its own files
+back at its next boot.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+import zlib
+
+K2OH_DIR = "/mnt/UDISK/.k2openhost"
+LIBRARY = os.path.join(K2OH_DIR, "mcu-fw")
+STAGED_FILE = os.path.join(LIBRARY, "staged")
+HOST_CONF = os.path.join(K2OH_DIR, "host.conf")
+FW_ROOT = os.environ.get("K2OH_FW_ROOT", "/usr/share/klipper/fw")
+ORIG_FW_ROOT = os.environ.get("K2OH_ORIG_FW_ROOT", "/rom/usr/share/klipper/fw")
+SEARCH_URL = "https://www.crealitycloud.com/api/cxy/search/firmwareSoftwareSearch"
+DEFAULT_BOARD = "CR0CN200400C10"
+FW_SUFFIXES = (".bin", "version.json")
+
+
+def die(msg, code=1):
+    print("k2oh-mcu-fw: %s" % msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True)
+    except OSError as exc:
+        return subprocess.CompletedProcess(cmd, 127, str(exc))
+
+
+def board_name():
+    out = run(["fw_printenv", "-n", "board"]).stdout.strip()
+    return out if re.fullmatch(r"[A-Z0-9]+", out or "") else DEFAULT_BOARD
+
+
+def model_dir():
+    """Firmware directory the stock mcu_update picks for this model."""
+    model = run(["get_sn_mac.sh", "model"]).stdout.strip()
+    if model in ("F012", "F021", "F025") or not model:
+        return "F012"
+    if model == "F008":
+        return "F008"
+    die("unsupported printer model %r" % model)
+
+
+def version_key(version):
+    return tuple(int(p) for p in re.findall(r"\d+", version))
+
+
+# --- Creality public firmware index -------------------------------------
+
+def search_releases(board):
+    headers = {
+        "Content-Type": "application/json",
+        "accept": "application/json",
+        "User-Agent": "k2-openhost",
+        "__CXY_PLATFORM_": "2",
+        "__CXY_BRAND_": "creality",
+        "__CXY_APP_ID_": "cxy-gen2",
+        "__CXY_APP_VER_": "7.3.28",
+        "__CXY_OS_LANG_": "0",
+        "__CXY_OS_VER_": "not set",
+        "__CXY_APP_CH_": "not set",
+        "__CXY_TIMEZONE_": "0",
+        "__CXY_DUID_": str(uuid.uuid4()),
+    }
+    pattern = re.compile(r"^%s(?:_R_\d+)?_ota_img_V([0-9.]+)\.img$" % re.escape(board))
+    releases = {}
+    for page in range(1, 21):
+        headers["__CXY_REQUESTID_"] = str(uuid.uuid4())
+        body = json.dumps({"keyword": board, "page": page, "pageSize": 20}).encode()
+        req = urllib.request.Request(SEARCH_URL, data=body, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+        if data.get("code") != 0:
+            die("Creality firmware index: %s" % data.get("msg"))
+        items = (data.get("result") or {}).get("list") or []
+        if not items:
+            break
+        for item in items:
+            name = re.sub(r"</?em>", "", item.get("name", ""))
+            url = item.get("downloadUrl", "")
+            m = pattern.match(name)
+            if not m or not url.startswith("https://") or not url.endswith("/" + name):
+                continue
+            releases[m.group(1)] = {
+                "version": m.group(1),
+                "name": name,
+                "url": url,
+                "size": int(item.get("firmwareSize") or 0),
+                "date": time.strftime("%Y-%m-%d", time.gmtime(int(item.get("createTime") or 0))),
+            }
+    return sorted(releases.values(), key=lambda r: version_key(r["version"]))
+
+
+# --- OTA image (cpio "070702") ------------------------------------------
+
+def cpio_members(f):
+    members, off = {}, 0
+    while True:
+        f.seek(off)
+        head = f.read(110)
+        if len(head) < 110 or head[:6] not in (b"070701", b"070702"):
+            raise ValueError("not a Creality OTA image (cpio header missing)")
+        fields = [int(head[6 + i * 8:14 + i * 8], 16) for i in range(13)]
+        size, namesize = fields[6], fields[11]
+        name = f.read(namesize).rstrip(b"\0").decode()
+        data = (off + 110 + namesize + 3) & ~3
+        if name == "TRAILER!!!":
+            return members
+        members[name] = (data, size)
+        off = (data + size + 3) & ~3
+
+
+def member_md5(f, offset, size):
+    h = hashlib.md5()
+    f.seek(offset)
+    left = size
+    while left:
+        chunk = f.read(min(left, 1 << 20))
+        if not chunk:
+            raise ValueError("truncated image")
+        h.update(chunk)
+        left -= len(chunk)
+    return h.hexdigest()
+
+
+# --- read-only squashfs 4.0 (gzip) reader --------------------------------
+
+class SquashFS:
+    """Enough of squashfs 4.0 to copy regular files out of a gzip image."""
+
+    def __init__(self, f, base=0):
+        self.f, self.base = f, base
+        f.seek(base)
+        sb = f.read(96)
+        (magic, _inodes, _mtime, self.block_size, self.frag_count, comp, _blog,
+         _flags, _ids, major, _minor, self.root_ref, self.bytes_used, _idt, _xat,
+         self.inode_table, self.dir_table, self.frag_table, _exp) = struct.unpack(
+            "<IIIIIHHHHHHQQQQQQQQ", sb)
+        if magic != 0x73717368 or major != 4:
+            raise ValueError("not a squashfs 4 image")
+        if comp != 1:
+            raise ValueError("unsupported squashfs compression %d" % comp)
+        self._frags = None
+
+    def _read(self, pos, size):
+        self.f.seek(self.base + pos)
+        data = self.f.read(size)
+        if len(data) != size:
+            raise ValueError("truncated squashfs")
+        return data
+
+    def _meta_block(self, pos):
+        (head,) = struct.unpack("<H", self._read(pos, 2))
+        size = head & 0x7FFF
+        data = self._read(pos + 2, size)
+        return (data if head & 0x8000 else zlib.decompress(data)), pos + 2 + size
+
+    def _meta(self, table, block, offset, length):
+        pos, out = table + block, b""
+        data, pos = self._meta_block(pos)
+        out = data[offset:]
+        while len(out) < length:
+            data, pos = self._meta_block(pos)
+            out += data
+        return out[:length], pos
+
+    def _inode(self, ref):
+        block, offset = ref >> 16, ref & 0xFFFF
+        raw, _ = self._meta(self.inode_table, block, offset, 64)
+        itype = struct.unpack("<H", raw[:2])[0]
+        body = raw[16:]
+        if itype == 1:
+            start, _nl, size, off, _par = struct.unpack("<IIHHI", body[:16])
+            return {"type": "dir", "start": start, "size": size, "offset": off}
+        if itype == 8:
+            _nl, size, start, _par, _ic, off, _x = struct.unpack("<IIIIHHI", body[:24])
+            return {"type": "dir", "start": start, "size": size, "offset": off}
+        if itype == 2:
+            start, frag, foff, size = struct.unpack("<IIII", body[:16])
+            rest = body[16:]
+        elif itype == 9:
+            start, size, _sp, _nl, frag, foff, _x = struct.unpack("<QQQIIII", body[:40])
+            rest = body[40:]
+        else:
+            return {"type": "other"}
+        has_frag = frag != 0xFFFFFFFF
+        nblocks = size // self.block_size if has_frag else -(-size // self.block_size)
+        header = len(raw) - len(rest)
+        if len(rest) < 4 * nblocks:
+            raw, _ = self._meta(self.inode_table, block, offset, header + 4 * nblocks)
+            rest = raw[header:]
+        blocks = struct.unpack("<%dI" % nblocks, rest[:4 * nblocks])
+        return {"type": "file", "start": start, "size": size, "frag": frag,
+                "frag_offset": foff, "blocks": blocks, "has_frag": has_frag}
+
+    def listdir(self, ref):
+        node = self._inode(ref)
+        if node["type"] != "dir":
+            raise ValueError("not a directory")
+        length = node["size"] - 3
+        if length <= 0:
+            return {}
+        raw, _ = self._meta(self.dir_table, node["start"], node["offset"], length)
+        entries, pos = {}, 0
+        while pos < len(raw):
+            count, start, _inum = struct.unpack("<III", raw[pos:pos + 12])
+            pos += 12
+            for _ in range(count + 1):
+                offset, _delta, _etype, nsize = struct.unpack("<HhHH", raw[pos:pos + 8])
+                name = raw[pos + 8:pos + 9 + nsize].decode()
+                pos += 9 + nsize
+                entries[name] = (start << 16) | offset
+        return entries
+
+    def lookup(self, path):
+        ref = self.root_ref
+        for part in [p for p in path.split("/") if p]:
+            entries = self.listdir(ref)
+            if part not in entries:
+                raise FileNotFoundError(path)
+            ref = entries[part]
+        return ref
+
+    def _fragment(self, index):
+        if self._frags is None:
+            self._frags = {}
+        if index not in self._frags:
+            ptr_pos = self.frag_table + (index // 512) * 8
+            (block_pos,) = struct.unpack("<Q", self._read(ptr_pos, 8))
+            raw, _ = self._meta(block_pos, 0, (index % 512) * 16, 16)
+            start, size, _u = struct.unpack("<QII", raw)
+            data = self._read(start, size & 0xFFFFFF)
+            self._frags[index] = data if size & 0x1000000 else zlib.decompress(data)
+        return self._frags[index]
+
+    def read_file(self, ref):
+        node = self._inode(ref)
+        if node["type"] != "file":
+            raise ValueError("not a regular file")
+        out, pos = bytearray(), node["start"]
+        for size in node["blocks"]:
+            real = size & 0xFFFFFF
+            if real == 0:
+                out += bytes(self.block_size)
+                continue
+            data = self._read(pos, real)
+            out += data if size & 0x1000000 else zlib.decompress(data)
+            pos += real
+        if node["has_frag"]:
+            frag = self._fragment(node["frag"])
+            out += frag[node["frag_offset"]:node["frag_offset"] + node["size"] - len(out)]
+        return bytes(out[:node["size"]])
+
+    def walk_files(self, path):
+        """Yield (relative path, inode ref) for every regular file under path."""
+        stack = [("", self.lookup(path))]
+        while stack:
+            rel, ref = stack.pop()
+            for name, child in sorted(self.listdir(ref).items()):
+                node = self._inode(child)
+                sub = rel + "/" + name if rel else name
+                if node["type"] == "dir":
+                    stack.append((sub, child))
+                elif node["type"] == "file":
+                    yield sub, child
+
+
+# --- firmware sets --------------------------------------------------------
+
+def fw_files(root):
+    found = []
+    for base, _dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith(FW_SUFFIXES):
+                found.append(os.path.relpath(os.path.join(base, name), root))
+    return sorted(found)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def extract_set(image, dest, model):
+    with open(image, "rb") as f:
+        members = cpio_members(f)
+        for need in ("rootfs", "cpio_item_md5"):
+            if need not in members:
+                raise ValueError("image has no %s" % need)
+        off, size = members["cpio_item_md5"]
+        f.seek(off)
+        md5s = {}
+        for line in f.read(size).decode().splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                md5s[parts[1]] = parts[0]
+        r_off, r_size = members["rootfs"]
+        print("checking rootfs MD5...")
+        if member_md5(f, r_off, r_size) != md5s.get("rootfs"):
+            raise ValueError("rootfs MD5 does not match the image's cpio_item_md5")
+        sq = SquashFS(f, r_off)
+        files = {}
+        for sub in (model, "cfs"):
+            for rel, ref in sq.walk_files("usr/share/klipper/fw/" + sub):
+                if not rel.endswith(FW_SUFFIXES):
+                    continue
+                target = os.path.join(dest, sub, rel)
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                data = sq.read_file(ref)
+                with open(target, "wb") as out:
+                    out.write(data)
+                files[sub + "/" + rel] = hashlib.sha256(data).hexdigest()
+        if not any(name.startswith(model + "/") for name in files):
+            raise ValueError("no %s firmware in this image" % model)
+        return files
+
+
+def download(url, path, size):
+    tmp = path + ".part"
+    req = urllib.request.Request(url, headers={"User-Agent": "k2-openhost"})
+    with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+        done, last = 0, 0
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            if size and done - last >= 10 << 20:
+                last = done
+                print("  %3d%%  %d MB" % (done * 100 // size, done >> 20), flush=True)
+    if size and done != size:
+        os.unlink(tmp)
+        raise ValueError("download size %d, index says %d" % (done, size))
+    os.replace(tmp, path)
+
+
+def load_manifest(version):
+    path = os.path.join(LIBRARY, version, "manifest.json")
+    if not os.path.isfile(path):
+        die("version %s is not downloaded (k2oh-mcu-fw download %s)" % (version, version))
+    with open(path) as f:
+        manifest = json.load(f)
+    for name, digest in manifest["files"].items():
+        if sha256_file(os.path.join(LIBRARY, version, name)) != digest:
+            die("%s/%s does not match its manifest" % (version, name))
+    return manifest
+
+
+def read_staged():
+    try:
+        with open(STAGED_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def replace_set(src_root, model, label):
+    """Make FW_ROOT/<model> and FW_ROOT/cfs hold exactly src_root's files."""
+    for sub in (model, "cfs"):
+        for rel in fw_files(os.path.join(FW_ROOT, sub)):
+            os.unlink(os.path.join(FW_ROOT, sub, rel))
+        for rel in fw_files(os.path.join(src_root, sub)):
+            target = os.path.join(FW_ROOT, sub, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(os.path.join(src_root, sub, rel), target)
+    os.sync()
+    print("slot B firmware files now: %s" % label)
+
+
+def require_slot_b():
+    if not os.path.exists("/etc/k2openhost-release") and "K2OH_FW_ROOT" not in os.environ:
+        die("this runs on K2-OpenHost slot B")
+
+
+# --- commands -------------------------------------------------------------
+
+def cmd_list(_args):
+    staged = read_staged()
+    for r in search_releases(board_name()):
+        marks = []
+        if os.path.isfile(os.path.join(LIBRARY, r["version"], "manifest.json")):
+            marks.append("downloaded")
+        if r["version"] == staged:
+            marks.append("staged")
+        print("%-12s %s  %4d MB  %s" % (r["version"], r["date"], r["size"] >> 20, ", ".join(marks)))
+
+
+def board_versions():
+    boards = []
+    try:
+        with open("/tmp/.mcu_version") as f:
+            for role, info in json.load(f).items():
+                boards.append((role, info.get("version", "")))
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/tmp/.485_mcu_version") as f:
+            for group, items in json.load(f).items():
+                for item in items:
+                    boards.append(("%s@%s" % (group.rstrip("s").lower(), item.get("addr")), item.get("version", "")))
+    except (OSError, ValueError):
+        pass
+    return boards
+
+
+def cmd_status(_args):
+    model = model_dir()
+    files = fw_files(os.path.join(FW_ROOT, model)) + ["cfs/" + n for n in fw_files(os.path.join(FW_ROOT, "cfs"))]
+    by_hw = {}
+    for rel in files:
+        name = os.path.basename(rel)
+        if name.endswith(".bin") and "-" in name:
+            by_hw.setdefault(name.split("-")[0], []).append(name[:-4])
+    print("Firmware files : %s (%s)" % (read_staged() or "slot B original", os.path.join(FW_ROOT, model)))
+    boards = board_versions()
+    if not boards:
+        print("No board versions yet (/tmp/.mcu_version is written by mcu_update at boot).")
+    for role, version in boards:
+        hw = version.split("-")[0]
+        targets = by_hw.get(hw, [])
+        if not version:
+            state = "unknown version"
+        elif len(targets) == 1:
+            state = "up to date" if targets[0] == version else "-> %s" % targets[0]
+        elif not targets:
+            state = "no file for %s" % hw
+        else:
+            state = "several files for %s (stock skips it)" % hw
+        print("  %-12s %-28s %s" % (role, version or "?", state))
+    print("The CFS is not flashed by 'apply'.")
+
+
+def cmd_download(args):
+    board, model = board_name(), model_dir()
+    releases = search_releases(board)
+    if not releases:
+        die("no releases found for %s" % board)
+    pick = releases[-1] if args.version in (None, "latest") else next(
+        (r for r in releases if r["version"] == args.version), None)
+    if not pick:
+        die("version %s not in the Creality index" % args.version)
+    dest = os.path.join(LIBRARY, pick["version"])
+    if os.path.isfile(os.path.join(dest, "manifest.json")):
+        print("%s is already downloaded" % pick["version"])
+        return
+    os.makedirs(LIBRARY, exist_ok=True)
+    work = os.path.join(LIBRARY, ".download")
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
+    image = os.path.join(work, pick["name"])
+    try:
+        print("downloading %s (%d MB)" % (pick["name"], pick["size"] >> 20))
+        download(pick["url"], image, pick["size"])
+        print("extracting MCU, motor and CFS firmware")
+        files = extract_set(image, os.path.join(work, "set"), model)
+        manifest = {"version": pick["version"], "board": board, "model": model,
+                    "source": pick["url"], "image": pick["name"], "files": files,
+                    "downloaded": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        with open(os.path.join(work, "set", "manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+        shutil.rmtree(dest, ignore_errors=True)
+        os.replace(os.path.join(work, "set"), dest)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)   # the image and anything left over
+    print("kept %d files in %s; the image was deleted" % (len(files), dest))
+    for name in sorted(files):
+        print("  " + name)
+
+
+def cmd_stage(args):
+    require_slot_b()
+    model = model_dir()
+    manifest = load_manifest(args.version)
+    if manifest.get("model") != model:
+        die("%s holds %s firmware, this printer needs %s" % (args.version, manifest.get("model"), model))
+    before = set(fw_files(os.path.join(FW_ROOT, model)))
+    replace_set(os.path.join(LIBRARY, args.version), model, args.version)
+    after = set(fw_files(os.path.join(FW_ROOT, model)))
+    with open(STAGED_FILE, "w") as f:
+        f.write(args.version + "\n")
+    for name in sorted(before - after):
+        print("  - " + name)
+    for name in sorted(after - before):
+        print("  + " + name)
+    print("Slot B flashes these at its next boot, or now with 'k2oh-mcu-fw apply'.")
+    print("Slot A flashes its own files back at its next boot.")
+
+
+def cmd_unstage(_args):
+    require_slot_b()
+    if not os.path.isdir(os.path.join(ORIG_FW_ROOT, model_dir())):
+        die("slot B's original files are not visible at %s" % ORIG_FW_ROOT)
+    replace_set(ORIG_FW_ROOT, model_dir(), "slot B original")
+    if os.path.exists(STAGED_FILE):
+        os.unlink(STAGED_FILE)
+
+
+def host_klipper_state(url=None):
+    try:
+        with open(HOST_CONF) as f:
+            for line in f:
+                if line.startswith("MOONRAKER_URL=") and not url:
+                    url = line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    if not url:
+        return None
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/server/info", timeout=5) as resp:
+            return json.load(resp)["result"].get("klippy_state", "unknown")
+    except Exception as exc:
+        return "unreachable (%s)" % exc
+
+
+def cmd_apply(args):
+    require_slot_b()
+    state = host_klipper_state(args.moonraker)
+    if state is None:
+        if not args.host_stopped:
+            die("stop Klipper on the external host first, then rerun with --host-stopped "
+                "(or set MOONRAKER_URL=http://<host>:7125 in %s)" % HOST_CONF)
+    elif state in ("ready", "startup"):
+        die("Klipper on the external host is %s: stop it first (sudo systemctl stop klipper)" % state)
+    else:
+        print("external host Klipper: %s" % state)
+    print("This power-cycles the printer's MCUs and flashes every board whose version differs")
+    print("from the files in %s (%s). The CFS is not flashed." % (FW_ROOT, read_staged() or "slot B original"))
+    if not args.yes:
+        if input("Type 'flash' to continue: ").strip() != "flash":
+            die("cancelled")
+    log_size = os.path.getsize("/tmp/mcu_update.log") if os.path.exists("/tmp/mcu_update.log") else 0
+    try:
+        print("stopping the bridges")
+        run(["/etc/init.d/k2oh-bridge", "stop"])
+        print("power-cycling the MCU rail")
+        run(["/usr/bin/mcu_reset.sh"])
+        print("running the stock mcu_update (this can take several minutes)")
+        env = {k: v for k, v in os.environ.items() if k not in ("CFS", "FORCE")}
+        subprocess.run(["/etc/init.d/mcu_update", "start"], env=env)
+    finally:
+        print("starting the bridges")
+        run(["/etc/init.d/k2oh-bridge", "start"])
+    try:
+        with open("/tmp/mcu_update.log") as f:
+            f.seek(log_size)
+            print(f.read())
+    except OSError:
+        pass
+    cmd_status(args)
+    print("Start Klipper on the external host again (FIRMWARE_RESTART or systemctl start klipper).")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="k2oh-mcu-fw", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("list")
+    sub.add_parser("status")
+    p = sub.add_parser("download")
+    p.add_argument("version", nargs="?")
+    p = sub.add_parser("stage")
+    p.add_argument("version")
+    sub.add_parser("unstage")
+    p = sub.add_parser("apply")
+    p.add_argument("--host-stopped", action="store_true", help="Klipper on the external host is stopped")
+    p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    p.add_argument("--moonraker", metavar="URL", help="external host Moonraker, e.g. http://10.10.1.97:7125")
+    args = parser.parse_args()
+    if os.geteuid() != 0 and args.cmd in ("download", "stage", "unstage", "apply"):
+        die("run as root")
+    commands = {"list": cmd_list, "status": cmd_status, "download": cmd_download,
+                "stage": cmd_stage, "unstage": cmd_unstage, "apply": cmd_apply}
+    if not args.cmd:
+        parser.print_help()
+        return
+    try:
+        commands[args.cmd](args)
+    except (ValueError, OSError, urllib.error.URLError) as exc:
+        die(str(exc))
+
+
+if __name__ == "__main__":
+    main()
