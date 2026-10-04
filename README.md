@@ -18,9 +18,10 @@ The stock Creality system that slot A runs (1.1.0.94), with these changes:
 | Change | Why |
 | --- | --- |
 | Writable layer in `/mnt/UDISK/.k2openhost/overlay` | `rootfs_data` is slot A's overlay partition; slot B never mounts, checks or formats it. |
+| UDISK is never formatted, checked or wiped | UDISK holds slot A's data. The stock boot hook that formats UDISK/`rootfs_data` when they do not look like ext4 and zeroes the partitions in `parts_clean` only creates the `/dev/by-name` links; block-mount runs no `e2fsck`; slot B adds only its `.k2openhost` directory. |
 | `k2oh-gadget` service | Puts USB0 in device mode and creates three Generic Serial functions (`0525:a4a6`, interfaces 00/01/02). |
 | `k2oh-bridge` service | One bridge process per bus: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motors, 230400 8N1. It is the bridge validated on the reference printer, restarted by procd. |
-| Disabled: Klipper, klipper_mcu, Moonraker, nginx, Creality UI/cloud apps (`app`), ADB, WebRTC camera, USB-stick OTA | The external host runs Klipper; ADB would take the USB controller; an OTA started from slot B would overwrite slot A. |
+| Disabled: Klipper, klipper_mcu, Moonraker, nginx, Creality UI/cloud apps (`app`), ADB, WebRTC camera, USB-stick OTA, factory reset (`wipe_data`) | The external host runs Klipper; ADB would take the USB controller; an OTA started from slot B would overwrite slot A; the factory reset deletes most of UDISK. |
 | `chamber_cam_power.sh` does nothing | On the K2 Pro its `restart` reads `usbc0/usb_host`, which switches USB0 back to host mode and drops all three channels. |
 | `k2oh-slot` command | Shows and switches the boot slot. |
 

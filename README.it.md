@@ -18,9 +18,10 @@ Il sistema Creality originale dello slot A (1.1.0.94), con queste modifiche:
 | Modifica | Perché |
 | --- | --- |
 | Livello scrivibile in `/mnt/UDISK/.k2openhost/overlay` | `rootfs_data` è la partizione overlay dello slot A: lo slot B non la monta, non la controlla e non la formatta mai. |
+| UDISK non viene mai formattato, controllato o cancellato | UDISK contiene i dati dello slot A. Lo script di avvio originale che formatta UDISK/`rootfs_data` quando non sembrano ext4 e azzera le partizioni elencate in `parts_clean` crea solo i link `/dev/by-name`; il montaggio automatico non lancia `e2fsck`; lo slot B aggiunge solo la sua cartella `.k2openhost`. |
 | Servizio `k2oh-gadget` | Mette la USB0 in modalità device e crea tre funzioni Generic Serial (`0525:a4a6`, interfacce 00/01/02). |
 | Servizio `k2oh-bridge` | Un processo bridge per bus: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motori, 230400 8N1. È il bridge validato sulla stampante di riferimento, riavviato da procd. |
-| Disattivati: Klipper, klipper_mcu, Moonraker, nginx, app Creality di interfaccia e cloud (`app`), ADB, telecamera WebRTC, OTA da chiavetta | Klipper gira sull'host esterno; ADB prenderebbe il controller USB; un OTA avviato dallo slot B sovrascriverebbe lo slot A. |
+| Disattivati: Klipper, klipper_mcu, Moonraker, nginx, app Creality di interfaccia e cloud (`app`), ADB, telecamera WebRTC, OTA da chiavetta, ripristino di fabbrica (`wipe_data`) | Klipper gira sull'host esterno; ADB prenderebbe il controller USB; un OTA avviato dallo slot B sovrascriverebbe lo slot A; il ripristino di fabbrica cancella quasi tutto UDISK. |
 | `chamber_cam_power.sh` non fa nulla | Sulla K2 Pro il suo `restart` legge `usbc0/usb_host`, che riporta la USB0 in modalità host e fa cadere tutti e tre i canali. |
 | Comando `k2oh-slot` | Mostra e cambia lo slot di avvio. |
 

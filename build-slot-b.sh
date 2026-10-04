@@ -30,7 +30,8 @@ KNOWN_KERNEL_MD5="42ced67cb382d6919737a15aab658ff6"
 KNOWN_ROOTFS_MD5="ea8da1a09c56eb33175822f840cb7fa2"
 
 # Init scripts disabled in slot B (their /etc/rc.d links are removed).
-DISABLED_SERVICES="klipper klipper_mcu moonraker nginx app adbd webrtc S99swupdate_autorun"
+# wipe_data is the factory reset: it deletes most of UDISK, which slot A uses.
+DISABLED_SERVICES="klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data S99swupdate_autorun"
 
 kernel="" rootfs="" out="" tools="" allow_other=0
 while [ $# -gt 0 ]; do
@@ -91,7 +92,9 @@ ln -sf ../init.d/k2oh-gadget "$root/etc/rc.d/K11k2oh-gadget"
 ln -sf ../init.d/k2oh-bridge "$root/etc/rc.d/S56k2oh-bridge"
 ln -sf ../init.d/k2oh-bridge "$root/etc/rc.d/K10k2oh-bridge"
 # rootfs_data belongs to slot A: do not let block-mount attach it to /overlay.
+# block-mount must not run e2fsck on UDISK either.
 awk -v q="'" '
+	/option[ \t]+check_fs/ { sub(/.1.[ \t]*$/, q "0" q) }
 	/^config/ { ov = 0 }
 	/option[ \t]+target[ \t]+.\/overlay./ { ov = 1 }
 	ov && /option[ \t]+enabled/ { sub(/.1.[ \t]*$/, q "0" q) }
@@ -99,9 +102,11 @@ awk -v q="'" '
 ' "$root/etc/config/fstab" > "$root/etc/config/fstab.k2oh"
 cat "$root/etc/config/fstab.k2oh" > "$root/etc/config/fstab"
 rm "$root/etc/config/fstab.k2oh"
-# Stock preinit reformats rootfs_data when it is not ext4; slot B never
-# touches slot A's overlay partition.
-sed -i '/do_check_format \/dev\/by-name\/rootfs_data/d' "$root/lib/preinit/79_format_partition"
+# Stock preinit formats UDISK and rootfs_data when they do not look like ext4
+# and zeroes the partitions listed in the parts_clean U-Boot variable. Slot B
+# shares both with slot A, so it only creates the /dev/by-name links.
+sed -i -e '/^[[:space:]]*clean_parts$/d' -e '/^[[:space:]].*do_check_format \/dev\/by-name\//d' \
+	"$root/lib/preinit/79_format_partition"
 chmod 0755 "$root/etc/dropbear"
 printf '%s\n' "$release" > "$root/etc/k2openhost-release"
 APPLY
@@ -110,17 +115,18 @@ release="$(printf 'version=%s\nbuilt=%s\nbase_kernel_md5=%s\nbase_rootfs_md5=%s'
 fakeroot -i "$state" -s "$state" bash "$work/apply.sh" "$root" "$HERE/rootfs" "$DISABLED_SERVICES" "$release"
 
 say "Checking the result"
-for svc in klipper klipper_mcu moonraker nginx app adbd webrtc swupdate_autorun; do
+for svc in klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data swupdate_autorun; do
 	if ls "$root"/etc/rc.d/ | grep -qx "[SK][0-9][0-9]$svc"; then
 		echo "service $svc is still enabled" >&2; exit 1
 	fi
 done
 grep -A4 "target.*'/overlay'" "$root/etc/config/fstab" | grep -q "enabled.*'0'" \
 	|| { echo "the rootfs_data overlay is still enabled in /etc/config/fstab" >&2; exit 1; }
-! grep -q "do_check_format /dev/by-name/rootfs_data" "$root/lib/preinit/79_format_partition" \
-	|| { echo "79_format_partition still checks rootfs_data" >&2; exit 1; }
-grep -q "do_check_format /dev/by-name/UDISK" "$root/lib/preinit/79_format_partition" \
-	|| { echo "79_format_partition changed unexpectedly" >&2; exit 1; }
+grep -q "option[[:space:]]*check_fs[[:space:]]*'0'" "$root/etc/config/fstab" \
+	|| { echo "block-mount still checks filesystems" >&2; exit 1; }
+body="$(sed -n '/^do_format_filesystem()/,/^}/p' "$root/lib/preinit/79_format_partition" | grep -v '^[[:space:]]*$')"
+[ "$body" = "$(printf 'do_format_filesystem()\n{\n\tlink_by_name\n}')" ] \
+	|| { echo "79_format_partition still formats or cleans partitions:" >&2; echo "$body" >&2; exit 1; }
 
 say "Building rootfsB.squashfs"
 rm -f "$out/rootfsB.squashfs"
