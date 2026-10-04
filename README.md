@@ -183,7 +183,7 @@ It listens on `CTL_PORT` (7130). It answers only `HOST_IP`, and only requests wi
 - `on` and `estop` never wait for the host.
 - Only GPIO values are written; their direction (set at boot) is never changed. A power cycle always ends with the rail on, even if something fails.
 
-The host side is `[k2_t113]` in [kalico-k2pro](https://github.com/MzTechnology97/kalico-k2pro) (G-code `T113_STATUS`, `T113_BEEP`, `T113_MCU_POWER_CYCLE`, ...). The MCU rail is also a Moonraker power device:
+The host side is `[k2_t113]` in [kalico-k2pro](https://github.com/MzTechnology97/kalico-k2pro) (G-code `BOARD_STATUS`, `BUZZER`, `MCU_POWER_CYCLE`, ...). The MCU rail is also a Moonraker power device:
 
 ```ini
 [power K2_MCU_Power]
