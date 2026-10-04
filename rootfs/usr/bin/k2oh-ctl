@@ -1,0 +1,496 @@
+#!/usr/bin/python3
+"""K2-OpenHost control service on the T113 (slot B).
+
+A small HTTP service for the external host: telemetry of the T113, the
+printer's MCU power rail (GPIO140), the buzzer (GPIO164), the USB bridges
+and HelixScreen. It answers only the external host (HOST_IP in
+k2openhost.conf) and only requests carrying the shared token
+(X-K2OH-Token, from /mnt/UDISK/.k2openhost/ctl.token).
+
+    GET  /status          telemetry (read only)
+    POST /power/mcu       {"command": "status"|"on"|"off"} -> {"state": ...}
+    POST /mcu/cycle       power-cycle the MCU rail (bridges stopped around it)
+    POST /beep            {"ms": 200, "count": 1}
+    POST /bridges/restart restart the three USB bridges
+    POST /screen/restart  restart HelixScreen
+    POST /estop           cut the MCU rail now, no checks (hardware e-stop)
+
+/power/mcu matches Moonraker's generic "http" power device. Everything that
+interrupts the printer (off, cycle, bridge restart) first asks the host's
+Moonraker for the print state and refuses unless it is a known idle state;
+"force" skips that check only when Klippy is already shut down. /estop never
+asks: it is the last resort and only turns power off.
+
+GPIO140: 0 = MCU rail on, 1 = off (stock mcu_reset.sh). Only values are
+written; the direction set at boot is never changed.
+
+    k2oh-ctl [--conf FILE] [--port N] [--token-file FILE]
+"""
+
+import argparse
+import hmac
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+
+K2OH_DIR = "/mnt/UDISK/.k2openhost"
+DEFAULT_CONF = os.path.join(K2OH_DIR, "k2openhost.conf")
+DEFAULT_TOKEN = os.path.join(K2OH_DIR, "ctl.token")
+DEFAULT_PORT = 7130
+GPIO_ROOT = os.environ.get("K2OH_GPIO_ROOT", "/sys/class/gpio")
+BRIDGE_STATS = os.environ.get("K2OH_BRIDGE_STATS", "/tmp/k2oh-bridge")
+MCU_POWER_GPIO = 140
+BUZZER_GPIO = 164
+# Stock mcu_reset.sh keeps the rail off for 2 s; the live loader probe used 1 s.
+CYCLE_OFF_SECONDS = 2.0
+CYCLE_SETTLE_SECONDS = 1.0
+IDLE_PRINT_STATES = ("standby", "complete", "cancelled", "error")
+BRIDGES = (("main", "ttyGS0", "ttyS2"), ("nozzle", "ttyGS1", "ttyS3"),
+           ("rs485", "ttyGS2", "ttyS5"))
+HELIX_INITS = ("/etc/init.d/S99helixscreen", "/etc/init.d/helixscreen")
+MAX_BEEP_MS = 3000
+MAX_BEEP_COUNT = 5
+
+
+def read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def read_conf(path):
+    conf = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                key, sep, value = line.strip().partition("=")
+                if sep and key and not key.startswith("#"):
+                    conf[key] = value.strip().strip('"')
+    except OSError:
+        pass
+    return conf
+
+
+class Gpio:
+    def __init__(self, root=GPIO_ROOT):
+        self.root = root
+
+    def path(self, number, name):
+        return os.path.join(self.root, "gpio%d" % number, name)
+
+    def get(self, number):
+        value = read(self.path(number, "value"))
+        return None if value not in ("0", "1") else int(value)
+
+    def set(self, number, value):
+        if read(self.path(number, "direction")) != "out":
+            raise RuntimeError("gpio%d is not an output; not touching it" % number)
+        with open(self.path(number, "value"), "w") as f:
+            f.write("1" if value else "0")
+
+
+class Controller:
+    def __init__(self, conf, gpio=None, runner=None, clock=time.monotonic,
+                 sleep=time.sleep, moonraker=None):
+        self.conf = conf
+        self.gpio = gpio or Gpio()
+        self.run = runner or self._run
+        self.clock = clock
+        self.sleep = sleep
+        self.moonraker = moonraker or self._moonraker
+        self.lock = threading.Lock()
+        self.beep_lock = threading.Lock()
+        self.last_action = None
+
+    # --- helpers --------------------------------------------------------
+    @staticmethod
+    def _run(cmd):
+        try:
+            return subprocess.run(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT,
+                                  universal_newlines=True, timeout=60).returncode
+        except (OSError, subprocess.SubprocessError):
+            return 127
+
+    def _moonraker(self, path):
+        url = self.conf.get("MOONRAKER_URL")
+        if not url:
+            raise RuntimeError("MOONRAKER_URL is not set")
+        with urllib.request.urlopen(url.rstrip("/") + path, timeout=3) as resp:
+            return json.load(resp)["result"]
+
+    def host_state(self):
+        """('idle'|'busy'|'shutdown'|'unknown', detail)."""
+        try:
+            info = self.moonraker("/server/info")
+        except Exception as exc:
+            return "unknown", "external host Moonraker unreachable: %s" % exc
+        klippy = info.get("klippy_state") if isinstance(info, dict) else None
+        if klippy in ("shutdown", "error", "disconnected"):
+            return "shutdown", "Klippy is %s" % klippy
+        if klippy != "ready":
+            return "unknown", "Klippy is %r" % klippy
+        try:
+            status = self.moonraker(
+                "/printer/objects/query?print_stats=state")["status"]
+            state = status["print_stats"]["state"]
+        except Exception as exc:
+            return "unknown", "print state unreadable: %s" % exc
+        if state in IDLE_PRINT_STATES:
+            return "idle", "print state %s" % state
+        if state in ("printing", "paused"):
+            return "busy", "a print is %s" % state
+        return "unknown", "print state %r" % state
+
+    def require_idle(self, force=False):
+        state, detail = self.host_state()
+        if state == "idle" or (force and state == "shutdown"):
+            return detail
+        raise PermissionError("refused: %s" % detail)
+
+    def _note(self, action, result):
+        self.last_action = {"action": action, "result": result,
+                            "at": self.clock(), "wall": time.time()}
+
+    def _bridges(self, command):
+        cmd = self.conf.get("BRIDGE_%s_CMD" % command.upper())
+        argv = cmd.split() if cmd else ["/etc/init.d/k2oh-bridge", command]
+        return self.run(argv)
+
+    # --- actions ----------------------------------------------------------
+    def mcu_power_state(self):
+        value = self.gpio.get(MCU_POWER_GPIO)
+        return {0: "on", 1: "off"}.get(value, "unknown")
+
+    def mcu_power(self, command, force=False):
+        if command == "status":
+            return {"state": self.mcu_power_state()}
+        if command not in ("on", "off"):
+            raise ValueError("command must be status, on or off")
+        with self.lock:
+            if command == "off":
+                detail = self.require_idle(force)
+                self._bridges("stop")
+                self.gpio.set(MCU_POWER_GPIO, 1)
+            else:
+                detail = "power on"
+                self.gpio.set(MCU_POWER_GPIO, 0)
+                self.sleep(CYCLE_SETTLE_SECONDS)
+                if self._bridges("start") != 0:
+                    self._note("mcu_" + command, "bridges did not start")
+                    raise RuntimeError("MCU rail on, but the bridges did not start")
+            self._note("mcu_" + command, detail)
+            return {"state": self.mcu_power_state(), "detail": detail}
+
+    def mcu_cycle(self, force=False):
+        with self.lock:
+            detail = self.require_idle(force)
+            failures = []
+            if self._bridges("stop") != 0:
+                failures.append("bridge stop failed")
+            try:
+                self.gpio.set(MCU_POWER_GPIO, 1)
+                self.sleep(CYCLE_OFF_SECONDS)
+            finally:
+                # Whatever happened, the rail goes back on.
+                self.gpio.set(MCU_POWER_GPIO, 0)
+            self.sleep(CYCLE_SETTLE_SECONDS)
+            if self._bridges("start") != 0:
+                failures.append("bridge start failed")
+            result = "; ".join(failures) or "ok"
+            self._note("mcu_cycle", result)
+            if failures:
+                raise RuntimeError("MCU rail cycled, but: " + result)
+            return {"state": self.mcu_power_state(), "detail": detail,
+                    "next": "FIRMWARE_RESTART on the external host"}
+
+    def estop(self):
+        # No host check: this is the hardware stop. Bridges are left alone so
+        # the host sees the MCUs disappear and shuts down too.
+        self.gpio.set(MCU_POWER_GPIO, 1)
+        self._note("estop", "MCU rail off")
+        return {"state": self.mcu_power_state()}
+
+    def beep(self, ms=200, count=1, gap_ms=120):
+        ms = max(20, min(int(ms), MAX_BEEP_MS))
+        count = max(1, min(int(count), MAX_BEEP_COUNT))
+        if not self.beep_lock.acquire(False):
+            return {"queued": False, "detail": "already beeping"}
+
+        def worker():
+            try:
+                for n in range(count):
+                    self.gpio.set(BUZZER_GPIO, 1)
+                    self.sleep(ms / 1000.0)
+                    self.gpio.set(BUZZER_GPIO, 0)
+                    if n + 1 < count:
+                        self.sleep(gap_ms / 1000.0)
+            except Exception:
+                pass
+            finally:
+                try:
+                    self.gpio.set(BUZZER_GPIO, 0)
+                except Exception:
+                    pass
+                self.beep_lock.release()
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"queued": True, "ms": ms, "count": count}
+
+    def bridges_restart(self, force=False):
+        with self.lock:
+            detail = self.require_idle(force)
+            code = self._bridges("restart")
+            self._note("bridges_restart", "ok" if code == 0 else "exit %d" % code)
+            if code != 0:
+                raise RuntimeError("bridge restart exited with %d" % code)
+            return {"detail": detail}
+
+    def screen_restart(self):
+        init = next((p for p in HELIX_INITS if os.path.exists(p)), None)
+        if init is None:
+            raise RuntimeError("HelixScreen is not installed")
+        code = self.run([init, "restart"])
+        self._note("screen_restart", "ok" if code == 0 else "exit %d" % code)
+        if code != 0:
+            raise RuntimeError("HelixScreen restart exited with %d" % code)
+        return {"restarted": True}
+
+    # --- telemetry -------------------------------------------------------------
+    def status(self):
+        now = self.clock()
+        return {
+            "version": read("/etc/k2openhost-release", ""),
+            "slot": slot_name(),
+            "uptime_s": _float(read("/proc/uptime", "0").split()[0]),
+            "load": read("/proc/loadavg", "").split()[:3],
+            "mem_available_kb": meminfo("MemAvailable"),
+            "soc_temp_c": soc_temperature(),
+            "udisk_free_mb": disk_free_mb("/mnt/UDISK"),
+            "gadget": gadget_status(),
+            "bridges": bridge_status(now),
+            "mcu_power": self.mcu_power_state(),
+            "buzzer": {0: "off", 1: "on"}.get(self.gpio.get(BUZZER_GPIO), "unknown"),
+            "helixscreen": process_running("helix-screen"),
+            "wifi": wifi_status(),
+            "last_action": self.last_action,
+            "now": now,
+        }
+
+
+def _float(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def slot_name():
+    if os.path.exists("/etc/k2openhost-release"):
+        return "B"
+    return "A"
+
+
+def meminfo(key):
+    for line in (read("/proc/meminfo", "") or "").splitlines():
+        if line.startswith(key + ":"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def soc_temperature():
+    temps = []
+    for zone in sorted(os.listdir("/sys/class/thermal")) if os.path.isdir("/sys/class/thermal") else []:
+        value = read(os.path.join("/sys/class/thermal", zone, "temp"))
+        if value and value.lstrip("-").isdigit():
+            temps.append(int(value) / 1000.0)
+    return max(temps) if temps else None
+
+
+def disk_free_mb(path):
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize // (1024 * 1024)
+
+
+def gadget_status():
+    # Only read-only attributes. Never read usbc0's usb_host/usb_device/usb_null
+    # files: reading them switches the OTG role.
+    udc = read("/sys/kernel/config/usb_gadget/g1/UDC", "")
+    state = read("/sys/class/udc/%s/state" % udc) if udc else None
+    return {"bound": bool(udc), "udc": udc or None, "state": state}
+
+
+def process_running(name):
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        cmd = (read("/proc/%s/cmdline" % pid, "") or "").replace("\0", " ") + " "
+        if name in cmd:
+            return True
+    return False
+
+
+def bridge_status(now):
+    result = {}
+    for name, gs, uart in BRIDGES:
+        data = {}
+        try:
+            with open(os.path.join(BRIDGE_STATS, gs + ".json")) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        pid = data.get("pid")
+        alive = bool(pid) and os.path.exists("/proc/%d" % int(pid))
+        if not alive:
+            # A bridge without counters (another bridge program) still counts.
+            alive = process_running("/dev/" + gs + " ")
+
+        def age(key):
+            value = data.get(key)
+            return None if value is None else round(max(0.0, now - value), 1)
+
+        result[name] = {
+            "tty": "%s<->%s" % (gs, uart), "alive": alive,
+            "host_bytes": data.get("host_bytes"),
+            "uart_bytes": data.get("uart_bytes"),
+            "host_rx_age_s": age("last_host_rx"),
+            "uart_rx_age_s": age("last_uart_rx"),
+            "stats_age_s": age("updated"),
+        }
+    return result
+
+
+def wifi_status():
+    text = read("/proc/net/wireless", "") or ""
+    for line in text.splitlines()[2:]:
+        parts = line.split()
+        if len(parts) >= 4:
+            return {"iface": parts[0].rstrip(":"), "link": _float(parts[2].rstrip(".")),
+                    "level_dbm": _float(parts[3].rstrip("."))}
+    return None
+
+
+# --- HTTP ----------------------------------------------------------------------
+
+def make_handler(ctl, token, allowed):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "k2oh-ctl"
+
+        def log_message(self, fmt, *args):
+            sys.stderr.write("k2oh-ctl: %s %s\n" % (self.client_address[0], fmt % args))
+
+        def _reply(self, code, body):
+            data = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _authorized(self):
+            if allowed and self.client_address[0] not in allowed:
+                self._reply(403, {"error": "this address is not the external host"})
+                return False
+            sent = self.headers.get("X-K2OH-Token", "")
+            if not token or not hmac.compare_digest(sent, token):
+                self._reply(401, {"error": "missing or wrong token"})
+                return False
+            return True
+
+        def _body(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0:
+                return {}
+            if length > 4096:
+                raise ValueError("request too large")
+            data = json.loads(self.rfile.read(length).decode() or "{}")
+            if not isinstance(data, dict):
+                raise ValueError("JSON object expected")
+            return data
+
+        def do_GET(self):
+            if not self._authorized():
+                return
+            if self.path.split("?")[0] == "/status":
+                return self._reply(200, ctl.status())
+            self._reply(404, {"error": "unknown path"})
+
+        def do_POST(self):
+            if not self._authorized():
+                return
+            path = self.path.split("?")[0]
+            try:
+                body = self._body()
+                force = body.get("force") is True
+                if path == "/power/mcu":
+                    result = ctl.mcu_power(str(body.get("command", "status")), force)
+                elif path == "/mcu/cycle":
+                    result = ctl.mcu_cycle(force)
+                elif path == "/beep":
+                    result = ctl.beep(body.get("ms", 200), body.get("count", 1))
+                elif path == "/bridges/restart":
+                    result = ctl.bridges_restart(force)
+                elif path == "/screen/restart":
+                    result = ctl.screen_restart()
+                elif path == "/estop":
+                    result = ctl.estop()
+                else:
+                    return self._reply(404, {"error": "unknown path"})
+            except PermissionError as exc:
+                return self._reply(409, {"error": str(exc)})
+            except (ValueError, TypeError) as exc:
+                return self._reply(400, {"error": str(exc)})
+            except Exception as exc:
+                return self._reply(500, {"error": str(exc)})
+            self._reply(200, result)
+
+    return Handler
+
+
+class Server(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="k2oh-ctl", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--conf", default=DEFAULT_CONF)
+    parser.add_argument("--token-file", default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--bind", default="0.0.0.0")
+    args = parser.parse_args(argv)
+    conf = read_conf(args.conf)
+    token = read(args.token_file or conf.get("CTL_TOKEN_FILE") or DEFAULT_TOKEN, "")
+    if not token or not re.match(r"^[A-Za-z0-9_-]{16,}$", token):
+        print("k2oh-ctl: no valid token; run k2oh-setup first", file=sys.stderr)
+        return 1
+    host = conf.get("HOST_IP", "")
+    allowed = {host} if host else set()
+    port = args.port or int(conf.get("CTL_PORT") or DEFAULT_PORT)
+    ctl = Controller(conf)
+    server = Server((args.bind, port), make_handler(ctl, token, allowed))
+    print("k2oh-ctl: listening on %s:%d for %s" % (args.bind, port, host or "any host"), flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

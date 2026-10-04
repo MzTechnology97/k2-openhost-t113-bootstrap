@@ -31,11 +31,12 @@ This turns the printer's T113 board into a ready K2-OpenHost bridge: USB gadget 
 3. [Install, step by step](#install-step-by-step)
 4. [Trial boot, keep, go back](#trial-boot-keep-go-back)
 5. [What runs in slot B](#what-runs-in-slot-b)
-6. [Updating MCU, motor and CFS firmware](#updating-mcu-motor-and-cfs-firmware)
-7. [Why Creality's updater and not Jacob's](#why-creality-s-updater-and-not-jacob-s)
-8. [Troubleshooting](#troubleshooting)
-9. [Removing it](#removing-it)
-10. [Reference](#reference)
+6. [Control service (k2oh-ctl)](#control-service-k2oh-ctl)
+7. [Updating MCU, motor and CFS firmware](#updating-mcu-motor-and-cfs-firmware)
+8. [Why Creality's updater and not Jacob's](#why-creality-s-updater-and-not-jacob-s)
+9. [Troubleshooting](#troubleshooting)
+10. [Removing it](#removing-it)
+11. [Reference](#reference)
 
 ## How it works
 
@@ -146,6 +147,7 @@ After the trial boot:
 | `k2oh-gadget` | Puts USB0 in device mode and creates three Generic Serial functions (`0525:a4a6`, interfaces 00/01/02), as the host udev rules expect. |
 | `k2oh-bridge` | One bridge process per bus, restarted by procd: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motors, 230400 8N1. It is the bridge validated on the reference printer. |
 | `mcu_update` (stock) | Kept: at every boot it starts the Main and Nozzle MCU applications (they power up in Creality's loader). It also reflashes any board whose version differs from slot B's firmware files. |
+| `k2oh-ctl` | Control service for the external host: telemetry, MCU power rail, buzzer, bridges, HelixScreen. See [Control service](#control-service-k2oh-ctl). |
 | `k2oh-wifi` | Starts `wpa_supplicant` and `udhcpc` like Creality's `wifi-server` did, with the networks copied from slot A. Ethernet works as in stock. |
 | `k2oh-firstboot` / `k2oh-setup` | First boot: installs HelixScreen from the prepared archive and points it at `HOST_IP:7125`. Retried at each boot until it succeeds. `k2oh-setup --host <IP>` changes the host later (menu 29). |
 | HelixScreen | The touch UI on the printer screen, connected to Moonraker on the host. |
@@ -154,6 +156,65 @@ After the trial boot:
 | Protected | Slot A's `rootfs_data` is never mounted, checked or formatted. UDISK is only mounted (no `mkfs`, no `e2fsck`, `parts_clean` ignored). |
 
 Slot B's root password is the stock one (`creality_2024`) even if you changed slot A's.
+
+## Control service (k2oh-ctl)
+
+`k2oh-ctl` lets the external host reach the parts of the printer that only the T113 controls:
+- the **MCU power rail** (GPIO140): Main, Nozzle, extruder, X/Y motors and CFS share it;
+- the **buzzer** (GPIO164);
+- the **USB bridges**;
+- **HelixScreen**.
+
+It listens on `CTL_PORT` (7130). It answers only `HOST_IP`, and only requests with the header `X-K2OH-Token` carrying the token from `/mnt/UDISK/.k2openhost/ctl.token`. The install writes the token, and the installer helper copies it to the host.
+
+| Request | Effect |
+| --- | --- |
+| `GET /status` | telemetry: slot, release, uptime, load, memory, SoC temperature, UDISK free, USB gadget state, each bridge (alive, bytes, last data from host and UART), MCU power, buzzer, HelixScreen, Wi-Fi, last action |
+| `POST /power/mcu` `{"command": "status"\|"on"\|"off"}` | for Moonraker's `http` power device; answers `{"state": "on"\|"off"}`. `off` stops the bridges, then cuts the rail. `on` restores the rail, then starts the bridges. |
+| `POST /mcu/cycle` | power cycle: bridges stopped, rail off 2 s (as Creality's `mcu_reset.sh`), on, 1 s, bridges started; then `FIRMWARE_RESTART` on the host |
+| `POST /beep` `{"ms", "count"}` | buzzer, up to 3 s and 5 beeps |
+| `POST /bridges/restart` | restarts the three bridges; it takes under 5 s, so Klipper stays connected |
+| `POST /screen/restart` | restarts HelixScreen |
+| `POST /estop` | cuts the MCU rail at once, with no checks: the hardware emergency stop |
+
+**Safety:**
+- `off`, `cycle` and `bridges/restart` first ask the host's Moonraker for the print state. They refuse (HTTP 409) unless it is `standby`, `complete`, `cancelled` or `error`; a missing or unreadable state refuses too.
+- `"force": true` skips this only when Klippy is already shut down, for example after a lost MCU link.
+- `on` and `estop` never wait for the host.
+- Only GPIO values are written; their direction (set at boot) is never changed. A power cycle always ends with the rail on, even if something fails.
+
+The host side is `[k2_t113]` in [kalico-k2pro](https://github.com/MzTechnology97/kalico-k2pro) (G-code `T113_STATUS`, `T113_BEEP`, `T113_MCU_POWER_CYCLE`, ...). The MCU rail is also a Moonraker power device:
+
+```ini
+[power K2_MCU_Power]
+type: http
+on_url: http://<printer>:7130/power/mcu
+off_url: http://<printer>:7130/power/mcu
+status_url: http://<printer>:7130/power/mcu
+request_template:
+  {% do http_request.set_method("POST") %}
+  {% do http_request.add_header("X-K2OH-Token", "<token>") %}
+  {% do http_request.add_header("Content-Type", "application/json") %}
+  {% do http_request.set_body({"command": command}) %}
+  {% do http_request.send() %}
+response_template:
+  {% set resp = http_request.last_response().json() %}
+  {resp["state"]}
+locked_while_printing: True
+restart_klipper_when_powered: True
+restart_delay: 3
+```
+
+The installer helper writes this file for you.
+
+**Tested on the development K2 Pro:** `k2oh-ctl` was run from RAM on slot A with the printer idle. All of these worked:
+- telemetry, token and host checks;
+- the buzzer;
+- a bridge restart, with Klipper staying ready;
+- a power cycle (ready in 9 s, CFS 16 s, motors 21 s);
+- an e-stop followed by power on.
+
+The rest of slot B has not been booted on a printer yet.
 
 ## Updating MCU, motor and CFS firmware
 

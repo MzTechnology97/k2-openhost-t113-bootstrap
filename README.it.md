@@ -36,11 +36,12 @@ Va nello **slot B**. Lo **slot A**, il sistema che la stampante usa oggi, non vi
 3. [Installazione passo per passo](#installazione-passo-per-passo)
 4. [Avvio di prova, conferma, ritorno](#avvio-di-prova-conferma-ritorno)
 5. [Cosa gira nello slot B](#cosa-gira-nello-slot-b)
-6. [Aggiornare il firmware di MCU, motori e CFS](#aggiornare-il-firmware-di-mcu-motori-e-cfs)
-7. [Perché lo strumento Creality e non quello di Jacob](#perché-lo-strumento-creality-e-non-quello-di-jacob)
-8. [Risoluzione dei problemi](#risoluzione-dei-problemi)
-9. [Rimozione](#rimozione)
-10. [Riferimento](#riferimento)
+6. [Servizio di controllo (k2oh-ctl)](#servizio-di-controllo-k2oh-ctl)
+7. [Aggiornare il firmware di MCU, motori e CFS](#aggiornare-il-firmware-di-mcu-motori-e-cfs)
+8. [Perché lo strumento Creality e non quello di Jacob](#perché-lo-strumento-creality-e-non-quello-di-jacob)
+9. [Risoluzione dei problemi](#risoluzione-dei-problemi)
+10. [Rimozione](#rimozione)
+11. [Riferimento](#riferimento)
 
 ## Come funziona
 
@@ -155,6 +156,7 @@ Dopo l'avvio di prova:
 | `k2oh-gadget` | Mette la USB0 in modalità device e crea tre funzioni Generic Serial (`0525:a4a6`, interfacce 00/01/02), come si aspettano le regole udev dell'host. |
 | `k2oh-bridge` | Un processo bridge per bus, riavviato da procd: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motori, 230400 8N1. È il bridge validato sulla stampante di riferimento. |
 | `mcu_update` (originale) | Resta: a ogni avvio avvia le applicazioni di Main e Nozzle MCU (si accendono nel loader Creality), e riscrive ogni scheda la cui versione è diversa dai file firmware dello slot B. |
+| `k2oh-ctl` | Servizio di controllo per l'host esterno: telemetria, alimentazione delle MCU, buzzer, bridge, HelixScreen. Vedi [Servizio di controllo](#servizio-di-controllo-k2oh-ctl). |
 | `k2oh-wifi` | Avvia `wpa_supplicant` e `udhcpc` come faceva il `wifi-server` Creality, con le reti copiate dallo slot A. L'Ethernet funziona come nell'originale. |
 | `k2oh-firstboot` / `k2oh-setup` | Primo avvio: installa HelixScreen dall'archivio preparato e lo collega a `HOST_IP:7125`. Riprova a ogni avvio finché non riesce. `k2oh-setup --host <IP>` cambia l'host in seguito (menu 29). |
 | HelixScreen | L'interfaccia touch sullo schermo della stampante, collegata al Moonraker dell'host. |
@@ -163,6 +165,43 @@ Dopo l'avvio di prova:
 | Protetti | `rootfs_data` dello slot A non viene mai montata, controllata o formattata. UDISK viene solo montato (niente `mkfs`, niente `e2fsck`, `parts_clean` ignorato). |
 
 La password di root dello slot B è quella originale (`creality_2024`), anche se hai cambiato quella dello slot A.
+
+## Servizio di controllo (k2oh-ctl)
+
+`k2oh-ctl` permette all'host esterno di raggiungere le parti della stampante che solo il T113 controlla:
+- la **linea di alimentazione delle MCU** (GPIO140): Main, Nozzle, estrusore, motori X/Y e CFS la condividono;
+- il **buzzer** (GPIO164);
+- i **bridge USB**;
+- **HelixScreen**.
+
+Ascolta su `CTL_PORT` (7130). Risponde solo a `HOST_IP`, e solo alle richieste con l'header `X-K2OH-Token` che contiene il token di `/mnt/UDISK/.k2openhost/ctl.token`. L'installazione scrive il token e l'installer helper lo copia sull'host.
+
+| Richiesta | Effetto |
+| --- | --- |
+| `GET /status` | telemetria: slot, versione, uptime, carico, memoria, temperatura del SoC, spazio libero su UDISK, stato del gadget USB, ogni bridge (attivo, byte, ultimi dati da host e UART), alimentazione MCU, buzzer, HelixScreen, Wi-Fi, ultima azione |
+| `POST /power/mcu` `{"command": "status"\|"on"\|"off"}` | per il dispositivo di alimentazione `http` di Moonraker; risponde `{"state": "on"\|"off"}`. `off` ferma i bridge, poi toglie l'alimentazione. `on` la ridà, poi avvia i bridge. |
+| `POST /mcu/cycle` | ciclo di alimentazione: bridge fermi, linea spenta 2 s (come `mcu_reset.sh` di Creality), accesa, 1 s, bridge avviati; poi `FIRMWARE_RESTART` sull'host |
+| `POST /beep` `{"ms", "count"}` | buzzer, fino a 3 s e 5 bip |
+| `POST /bridges/restart` | riavvia i tre bridge; dura meno di 5 s, quindi Klipper resta connesso |
+| `POST /screen/restart` | riavvia HelixScreen |
+| `POST /estop` | toglie subito l'alimentazione alle MCU, senza controlli: l'arresto di emergenza hardware |
+
+**Sicurezza:**
+- `off`, `cycle` e `bridges/restart` chiedono prima al Moonraker dell'host lo stato di stampa. Rifiutano (HTTP 409) se non è `standby`, `complete`, `cancelled` o `error`; anche uno stato assente o illeggibile viene rifiutato.
+- `"force": true` salta questo controllo solo se Klippy è già in shutdown, per esempio dopo la perdita del collegamento con una MCU.
+- `on` ed `estop` non aspettano mai l'host.
+- Vengono scritti solo i valori dei GPIO; la loro direzione (impostata all'avvio) non viene mai cambiata. Un ciclo di alimentazione finisce sempre con la linea accesa, anche se qualcosa fallisce.
+
+Il lato host è `[k2_t113]` in [kalico-k2pro](https://github.com/MzTechnology97/kalico-k2pro) (G-code `T113_STATUS`, `T113_BEEP`, `T113_MCU_POWER_CYCLE`, ...). La linea MCU è anche un dispositivo di alimentazione di Moonraker: la configurazione è nella versione inglese di questo README (sezione "Control service") e l'installer helper la scrive per te.
+
+**Provato sulla K2 Pro di sviluppo:** `k2oh-ctl` è stato eseguito dalla RAM sullo slot A con la stampante inattiva. Ha funzionato tutto:
+- telemetria, controllo di token e host;
+- il buzzer;
+- un riavvio dei bridge, con Klipper rimasto pronto;
+- un ciclo di alimentazione (pronto in 9 s, CFS 16 s, motori 21 s);
+- un arresto di emergenza seguito dalla riaccensione.
+
+Il resto dello slot B non è ancora stato avviato su una stampante.
 
 ## Aggiornare il firmware di MCU, motori e CFS
 

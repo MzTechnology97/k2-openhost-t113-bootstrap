@@ -1,0 +1,19 @@
+#!/bin/sh /etc/rc.common
+# K2-OpenHost control service for the external host: T113 telemetry, MCU
+# power rail, buzzer, bridges (k2oh-ctl). Listens on CTL_PORT (default 7130)
+# and answers only HOST_IP with the token in /mnt/UDISK/.k2openhost/ctl.token.
+
+START=57
+STOP=09
+USE_PROCD=1
+
+start_service() {
+	[ -f /mnt/UDISK/.k2openhost/k2openhost.conf ] || return 0
+	[ -s /mnt/UDISK/.k2openhost/ctl.token ] || return 0
+	procd_open_instance
+	procd_set_param command /usr/bin/python3 /usr/bin/k2oh-ctl
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
