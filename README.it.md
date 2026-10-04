@@ -192,7 +192,7 @@ Ascolta su `CTL_PORT` (7130). Risponde solo a `HOST_IP`, e solo alle richieste c
 - `on` ed `estop` non aspettano mai l'host.
 - Vengono scritti solo i valori dei GPIO; la loro direzione (impostata all'avvio) non viene mai cambiata. Un ciclo di alimentazione finisce sempre con la linea accesa, anche se qualcosa fallisce.
 
-Il lato host è `[k2_t113]` in [kalico-k2pro](https://github.com/MzTechnology97/kalico-k2pro) (G-code `T113_STATUS`, `T113_BEEP`, `T113_MCU_POWER_CYCLE`, ...). La linea MCU è anche un dispositivo di alimentazione di Moonraker: la configurazione è nella versione inglese di questo README (sezione "Control service") e l'installer helper la scrive per te.
+Il lato host è `[k2_t113]` in [kalico-k2pro](https://github.com/MzTechnology97/kalico-k2pro) (G-code `BOARD_STATUS`, `BUZZER`, `MCU_POWER_CYCLE`, ...). La linea MCU è anche un dispositivo di alimentazione di Moonraker: la configurazione è nella versione inglese di questo README (sezione "Control service") e l'installer helper la scrive per te.
 
 **Provato sulla K2 Pro di sviluppo:** `k2oh-ctl` è stato eseguito dalla RAM sullo slot A con la stampante inattiva. Ha funzionato tutto:
 - telemetria, controllo di token e host;
