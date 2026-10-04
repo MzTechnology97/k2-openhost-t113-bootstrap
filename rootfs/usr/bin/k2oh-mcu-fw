@@ -63,7 +63,7 @@ def run(cmd):
         return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               universal_newlines=True)
     except OSError as exc:
-        return subprocess.CompletedProcess(cmd, 127, str(exc))
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
 def board_name():

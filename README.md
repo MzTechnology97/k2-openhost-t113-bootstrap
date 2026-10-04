@@ -91,7 +91,11 @@ external host (helper.sh)                              printer T113, running slo
    ./helper.sh
    ```
 
-   choose **23) Install the T113 bootstrap** (or run `./helper.sh t113 install`).
+   First choose **23) Check the printer** (`./helper.sh t113 check`). It is read-only and shows whether the printer is ready and which Creality release slot B would use:
+
+   <img src="https://raw.githubusercontent.com/MzTechnology97/k2-openhost-installer-helper/main/docs/images/cli-t113-check.png" alt="T113 check" width="720">
+
+   Then choose **24) Install the T113 bootstrap** (or run `./helper.sh t113 install`).
 3. **Confirm** the warning, then enter:
    - the **printer IP**;
    - the **host IP** as the printer sees it. The helper proposes the address of the interface that reaches the printer; press Enter to accept it.
@@ -119,10 +123,10 @@ external host (helper.sh)                              printer T113, running slo
 
 | Action | Menu | Command | What it does |
 | --- | --- | --- | --- |
-| Trial boot | 25 | `./helper.sh t113 boot-b` | Sets slot B for the next boot with a trial flag and reboots the printer. |
-| Keep slot B | 26 | `./helper.sh t113 commit` | Run on slot B once it works: slot B becomes the default. |
-| Back to slot A | 27 | `./helper.sh t113 boot-a` | Slot A at the next boot, then reboot. |
-| Status | 24 | `./helper.sh t113 status` | Running slot, next boot, trial flag, setup, HelixScreen. |
+| Trial boot | 26 | `./helper.sh t113 boot-b` | Sets slot B for the next boot with a trial flag and reboots the printer. |
+| Keep slot B | 27 | `./helper.sh t113 commit` | Run on slot B once it works: slot B becomes the default. |
+| Back to slot A | 28 | `./helper.sh t113 boot-a` | Slot A at the next boot, then reboot. |
+| Status | 25 | `./helper.sh t113 status` | Running slot, next boot, trial flag, setup, HelixScreen. |
 
 **How the trial boot protects you:** at the very start of slot B's boot, before any service, the boot environment is pointed back at slot A. If slot B hangs, crashes or you cannot reach it, **power cycle the printer and it returns to slot A**. Only `commit`, run on a working slot B, makes slot B the default.
 
@@ -133,7 +137,7 @@ After the trial boot:
 1. Connect the service Micro-USB cable to the host if it is not connected.
 2. Check that Klipper on the host connects (Mainsail shows the printer ready). The host's start gate waits up to 60 s for the three gadget channels.
 3. Check the screen: the first boot installs HelixScreen (about a minute), already pointed at your host.
-4. Run **26) Keep slot B**.
+4. Run **27) Keep slot B**.
 
 ## What runs in slot B
 
@@ -143,7 +147,7 @@ After the trial boot:
 | `k2oh-bridge` | One bridge process per bus, restarted by procd: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motors, 230400 8N1. It is the bridge validated on the reference printer. |
 | `mcu_update` (stock) | Kept: at every boot it starts the Main and Nozzle MCU applications (they power up in Creality's loader). It also reflashes any board whose version differs from slot B's firmware files. |
 | `k2oh-wifi` | Starts `wpa_supplicant` and `udhcpc` like Creality's `wifi-server` did, with the networks copied from slot A. Ethernet works as in stock. |
-| `k2oh-firstboot` / `k2oh-setup` | First boot: installs HelixScreen from the prepared archive and points it at `HOST_IP:7125`. Retried at each boot until it succeeds. `k2oh-setup --host <IP>` changes the host later (menu 28). |
+| `k2oh-firstboot` / `k2oh-setup` | First boot: installs HelixScreen from the prepared archive and points it at `HOST_IP:7125`. Retried at each boot until it succeeds. `k2oh-setup --host <IP>` changes the host later (menu 29). |
 | HelixScreen | The touch UI on the printer screen, connected to Moonraker on the host. |
 | Disabled | Creality Klipper, klipper_mcu, Moonraker, nginx, UI/cloud apps (`app`), ADB (it would take the USB controller), WebRTC camera, USB-stick OTA (an OTA from slot B would overwrite slot A), factory reset `wipe_data` (it deletes most of UDISK). |
 | `chamber_cam_power.sh` | Does nothing: on the K2 Pro its `restart` switches USB0 back to host mode and drops all three channels. |
@@ -157,13 +161,15 @@ Firmware updates are **manual on purpose**. Run them from slot B, with the print
 
 ### The short way: latest release
 
-From the host: menu **30) Update MCU firmware** (`./helper.sh t113 mcu-fw update`), or on the printer:
+From the host: menu **31) Update MCU firmware** (`./helper.sh t113 mcu-fw update`), or on the printer:
 
 ```sh
 k2oh-mcu-fw update          # add --cfs to include the CFS units
 ```
 
 It looks up the **latest** release in Creality's index, downloads it (only the firmware files are kept), stages it in slot B, shows which boards would change and asks **"Flash the boards now?"**. Answer no and nothing is flashed now; the staged files are flashed at slot B's next boot, or with `k2oh-mcu-fw apply`, or dropped with `k2oh-mcu-fw unstage`. Answer yes and it runs `apply` with all its checks (stop Klipper on the host first).
+
+<img src="https://raw.githubusercontent.com/MzTechnology97/k2-openhost-installer-helper/main/docs/images/cli-t113-mcu-fw-update.png" alt="k2oh-mcu-fw update" width="720">
 
 ### What gets updated
 
@@ -271,14 +277,14 @@ What Creality's tools lack: they are closed binaries, they log less, and they re
 | The printer does not come back after the trial boot | Power cycle it: it returns to slot A. Look at `/mnt/UDISK/.k2openhost/setup.log` from slot A. |
 | Klipper on the host does not connect | `./helper.sh doctor` checks the three channels. On the printer: `logread \| grep -E "k2oh\|bridge"`, `cat /sys/kernel/config/usb_gadget/g1/UDC`. |
 | The screen stays on the boot logo | `k2oh-setup status`, `cat /mnt/UDISK/.k2openhost/setup.log`; run `k2oh-setup` again. |
-| HelixScreen cannot reach Moonraker | Wrong host IP: menu 28 or `k2oh-setup --host <IP>`. Check that the printer reaches the host on port 7125. |
+| HelixScreen cannot reach Moonraker | Wrong host IP: menu 29 or `k2oh-setup --host <IP>`. Check that the printer reaches the host on port 7125. |
 | No network in slot B over Wi-Fi | Slot A had no saved network, or it was added later: set Wi-Fi from HelixScreen, or copy `/etc/wifi/wpa_supplicant/wpa_supplicant.conf`. |
 | `apply` refuses to run | Stop Klipper on the host (`sudo systemctl stop klipper`). |
 | An update failed half-way | Run `k2oh-mcu-fw apply` again: Creality's updater restarts each transfer from the beginning. Read `/tmp/mcu_update.log`. |
 
 ## Removing it
 
-1. `./helper.sh t113 boot-a` (menu 27). The printer runs slot A as before.
+1. `./helper.sh t113 boot-a` (menu 28). The printer runs slot A as before.
 2. Optional, from slot A: `rm -rf /mnt/UDISK/.k2openhost` removes slot B's writable layer, backups and downloaded firmware. Slot B's partitions stay as they are until a Creality OTA writes them.
 
 ## Reference
