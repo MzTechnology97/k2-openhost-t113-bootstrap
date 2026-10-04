@@ -167,7 +167,7 @@ From the host: menu **31) Update MCU firmware** (`./helper.sh t113 mcu-fw update
 k2oh-mcu-fw update          # add --cfs to include the CFS units
 ```
 
-It looks up the **latest** release in Creality's index, downloads it (only the firmware files are kept), stages it in slot B, shows which boards would change and asks **"Flash the boards now?"**. Answer no and nothing is flashed now; the staged files are flashed at slot B's next boot, or with `k2oh-mcu-fw apply`, or dropped with `k2oh-mcu-fw unstage`. Answer yes and it runs `apply` with all its checks (stop Klipper on the host first).
+It looks up the **latest** release in Creality's index, downloads it (only the firmware files are kept), stages it in slot B, shows which boards would change and asks **"Flash the boards now?"**. Answer no and nothing is flashed now; the staged files are flashed at slot B's next boot, or with `k2oh-mcu-fw apply`, or dropped with `k2oh-mcu-fw unstage`. Answer yes and it runs `apply` with all its checks. From the helper, Klipper is stopped for you when the printer is idle, and the proof that the host has let go of the ports is made and passed automatically (see [Stopping the host](#stopping-the-host)).
 
 <img src="https://raw.githubusercontent.com/MzTechnology97/k2-openhost-installer-helper/main/docs/images/cli-t113-mcu-fw-update.png" alt="k2oh-mcu-fw update" width="720">
 
@@ -210,13 +210,14 @@ On the printer (`ssh root@<printer>`), or from the host with `./helper.sh t113 m
    ```
 
    This replaces slot B's firmware files and lists which boards would change.
-4. **Stop Klipper on the host:**
+4. **Stop Klipper on the host and make the proof** (the helper does this for you):
 
    ```bash
    sudo systemctl stop klipper
+   sudo ~/k2-openhost-t113-bootstrap/host/k2oh-host-evidence
    ```
 
-   The MCU power is cycled during the update.
+   The MCU power is cycled during the update. The second command prints one line: the proof described in [Stopping the host](#stopping-the-host).
 5. **Flash:**
 
    ```sh
@@ -224,12 +225,34 @@ On the printer (`ssh root@<printer>`), or from the host with `./helper.sh t113 m
    k2oh-mcu-fw apply --cfs      # the same, then the CFS units
    ```
 
-   `apply` refuses to run while Moonraker on the host reports Klipper `ready` or `startup` (it reads `MOONRAKER_URL` from `k2openhost.conf`). It asks you to type `flash`. Then:
+   Pass the proof with `--host-evidence <line>`. `apply` checks the host first (see below), then asks you to type `flash`. `--yes` skips only that question, never the checks. Then:
    1. it stops the bridges;
    2. it power-cycles the MCU rail (`mcu_reset.sh`);
    3. it runs Creality's `mcu_update`;
    4. with `--cfs`, it runs the CFS pass below;
-   5. it starts the bridges and prints the log and the new versions.
+   5. it starts the bridges again, even when a step failed;
+   6. it prints the log and the new versions, and checks that every board except the CFS now matches its file.
+
+   Each step must exit with 0. If one fails, the next ones are skipped, the bridges are still started again, and `apply` exits with an error that names the step. A bridge restart that fails is an error too.
+
+#### Stopping the host
+
+Before anything is touched, `apply` needs **both** of these:
+
+| Check | Passes only when |
+| --- | --- |
+| Moonraker on the host (`MOONRAKER_URL` in `k2openhost.conf`, or `--moonraker`) | it answers and reports Klippy `disconnected` |
+| The host proof (`--host-evidence`) | the Klipper service is `inactive` or `failed`; no `klippy.py` process runs; the host sees all three interfaces of **this** printer's gadget (matched by the printer serial number); no process holds any of them open; every process was inspected (run as root); the proof is at most 15 minutes old |
+
+Everything else blocks:
+- Moonraker is unreachable, slow (timeout), answers with an HTTP error or with something that is not a `server/info` result;
+- no URL is configured;
+- Klippy is `ready`, `startup`, `shutdown` or `error`;
+- the proof is missing, stale, from another printer or made without root.
+
+Moonraker being down is never taken as proof that Klipper stopped, and Klippy `shutdown` still holds the ports. The proof contains the printer serial number: it only travels over SSH, do not paste it in public reports.
+
+**Manual path, without the helper:** on the host, stop Klipper and run `sudo k2oh-host-evidence` (in `host/` of this repository). Copy its line, then on the printer run `k2oh-mcu-fw apply --host-evidence <line>`. Start Klipper again only after `apply` reports success. If it reports that the bridges did not start, run `/etc/init.d/k2oh-bridge start` on the printer, or reboot it, before starting Klipper.
 6. **Start Klipper on the host again:**
 
    ```bash
@@ -279,7 +302,7 @@ What Creality's tools lack: they are closed binaries, they log less, and they re
 | The screen stays on the boot logo | `k2oh-setup status`, `cat /mnt/UDISK/.k2openhost/setup.log`; run `k2oh-setup` again. |
 | HelixScreen cannot reach Moonraker | Wrong host IP: menu 29 or `k2oh-setup --host <IP>`. Check that the printer reaches the host on port 7125. |
 | No network in slot B over Wi-Fi | Slot A had no saved network, or it was added later: set Wi-Fi from HelixScreen, or copy `/etc/wifi/wpa_supplicant/wpa_supplicant.conf`. |
-| `apply` refuses to run | Stop Klipper on the host (`sudo systemctl stop klipper`). |
+| `apply` refuses to run | It lists every reason. Stop Klipper on the host (`sudo systemctl stop klipper`), make a new proof (`sudo k2oh-host-evidence`) and check that Moonraker on the host answers. |
 | An update failed half-way | Run `k2oh-mcu-fw apply` again: Creality's updater restarts each transfer from the beginning. Read `/tmp/mcu_update.log`. |
 
 ## Removing it

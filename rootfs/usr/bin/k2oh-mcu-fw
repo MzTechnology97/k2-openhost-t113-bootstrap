@@ -12,6 +12,13 @@
     k2oh-mcu-fw unstage               go back to slot B's original files
     k2oh-mcu-fw apply [--cfs]         flash now with the stock Creality tools
 
+apply and update flash only when Moonraker on the external host reports
+Klippy disconnected AND --host-evidence carries a fresh proof from the host
+(sudo k2oh-host-evidence there): Klipper service stopped, no klippy.py, and
+no process holding this printer's three gadget ports. Anything unknown
+blocks; --yes skips only the confirmation. The installer helper stops
+Klipper (when idle) and passes the proof for you.
+
 The OTA image is read from Creality's public firmware index and downloaded
 from its CDN. Only /usr/share/klipper/fw/<model> and /usr/share/klipper/fw/cfs
 are kept (checked against the image's own MD5 list); the image is deleted.
@@ -28,11 +35,13 @@ files back at its next boot.
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -465,30 +474,41 @@ def board_versions():
     return boards
 
 
-def cmd_status(_args):
-    model = model_dir()
+def board_plan(model):
+    """[(role, running version, state, target or None)] for every board the
+    stock tool reported, against the files in FW_ROOT."""
     files = fw_files(os.path.join(FW_ROOT, model)) + ["cfs/" + n for n in fw_files(os.path.join(FW_ROOT, "cfs"))]
     by_hw = {}
     for rel in files:
         name = os.path.basename(rel)
         if name.endswith(".bin") and "-" in name:
             by_hw.setdefault(name.split("-")[0], []).append(name[:-4])
-    original = "slot B original (stock %s)" % slot_b_base()
-    print("Firmware files : %s (%s)" % (read_staged() or original, os.path.join(FW_ROOT, model)))
-    boards = board_versions()
-    if not boards:
-        print("No board versions yet (/tmp/.mcu_version is written by mcu_update at boot).")
-    for role, version in boards:
+    plan = []
+    for role, version in board_versions():
         hw = version.split("-")[0]
         targets = by_hw.get(hw, [])
+        target = None
         if not version:
             state = "unknown version"
         elif len(targets) == 1:
-            state = "up to date" if targets[0] == version else "-> %s" % targets[0]
+            target = targets[0]
+            state = "up to date" if target == version else "-> %s" % target
         elif not targets:
             state = "no file for %s" % hw
         else:
             state = "several files for %s (stock skips it)" % hw
+        plan.append((role, version, state, target))
+    return plan
+
+
+def cmd_status(_args):
+    model = model_dir()
+    original = "slot B original (stock %s)" % slot_b_base()
+    print("Firmware files : %s (%s)" % (read_staged() or original, os.path.join(FW_ROOT, model)))
+    plan = board_plan(model)
+    if not plan:
+        print("No board versions yet (/tmp/.mcu_version is written by mcu_update at boot).")
+    for role, version, state, _target in plan:
         print("  %-12s %-28s %s" % (role, version or "?", state))
     print("The CFS is flashed only by 'apply --cfs'.")
 
@@ -558,21 +578,175 @@ def cmd_unstage(_args):
         os.unlink(STAGED_FILE)
 
 
-def host_klipper_state(url=None):
+# --- external host check -------------------------------------------------
+#
+# Flashing needs the external host to have let go of the three gadget ports:
+# if Klipper still talks to the MCUs while their rail is cut and the stock
+# updater takes the UARTs, the host and the updater fight over the boards.
+# Nothing on the printer can see which process on the host holds a port, so
+# the proof comes from the host itself (host/k2oh-host-evidence, run by the
+# installer helper) and Moonraker must agree. Anything unknown blocks.
+
+EVIDENCE_VERSION = 1
+# 'update' downloads and stages before it flashes, so the proof may be a
+# few minutes old when it is checked. Moonraker is asked again right before
+# the flash, so a Klipper started in between is still caught.
+EVIDENCE_MAX_AGE = 900
+EVIDENCE_MAX_FUTURE = 120
+STOPPED_SERVICE_STATES = ("inactive", "failed")
+GADGET_INTERFACES = ("00", "01", "02")
+KLIPPY_ACTIVE_STATES = ("ready", "startup", "shutdown", "error")
+
+
+def read_host_conf(path=None):
+    conf = {}
     try:
-        with open(HOST_CONF) as f:
+        with open(path or HOST_CONF) as f:
             for line in f:
-                if line.startswith("MOONRAKER_URL=") and not url:
-                    url = line.split("=", 1)[1].strip()
+                key, sep, value = line.strip().partition("=")
+                if sep and key and not key.startswith("#"):
+                    conf[key] = value.strip().strip('"')
     except OSError:
         pass
+    return conf
+
+
+def moonraker_state(url, timeout=5):
+    """What the external host's Moonraker says about Klippy.
+
+    {"status": ..., "detail": ...} where status is one of
+      no_config   no Moonraker URL configured
+      timeout     no answer in time
+      unreachable connection refused, DNS, no route, ...
+      http_error  Moonraker answered with an HTTP error
+      malformed   the answer is not a server/info result
+      active      Klippy is connected (ready, startup, shutdown or error)
+      stopped     Moonraker runs and Klippy is disconnected
+    Only "stopped" lets a flash go ahead, and only together with the host's
+    own proof: Moonraker down says nothing about the serial ports.
+    """
     if not url:
-        return None
+        return {"status": "no_config", "detail": "MOONRAKER_URL is not set in %s" % HOST_CONF}
     try:
-        with urllib.request.urlopen(url.rstrip("/") + "/server/info", timeout=5) as resp:
-            return json.load(resp)["result"].get("klippy_state", "unknown")
-    except Exception as exc:
-        return "unreachable (%s)" % exc
+        with urllib.request.urlopen(url.rstrip("/") + "/server/info", timeout=timeout) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        return {"status": "http_error", "detail": "HTTP %s" % exc.code}
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, socket.timeout):
+            return {"status": "timeout", "detail": "no answer within %d s" % timeout}
+        return {"status": "unreachable", "detail": str(exc.reason)}
+    except socket.timeout:
+        return {"status": "timeout", "detail": "no answer within %d s" % timeout}
+    except (OSError, ValueError) as exc:
+        return {"status": "unreachable", "detail": str(exc)}
+    try:
+        result = json.loads(body.decode("utf-8"))["result"]
+        connected = result["klippy_connected"]
+        state = result["klippy_state"]
+    except (ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError):
+        return {"status": "malformed", "detail": "not a Moonraker server/info answer"}
+    if not isinstance(connected, bool) or not isinstance(state, str):
+        return {"status": "malformed", "detail": "unexpected klippy_connected/klippy_state types"}
+    if connected or state in KLIPPY_ACTIVE_STATES:
+        return {"status": "active", "detail": "Klippy is %s" % state}
+    if state == "disconnected":
+        return {"status": "stopped", "detail": "Klippy is disconnected"}
+    return {"status": "malformed", "detail": "unknown Klippy state %r" % state}
+
+
+def decode_evidence(text):
+    """(evidence dict, None) or (None, reason)."""
+    if not text:
+        return None, "no proof from the external host (--host-evidence)"
+    try:
+        evidence = json.loads(base64.b64decode(text.strip(), validate=True).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, "the host proof is not valid k2oh-host-evidence output"
+    if not isinstance(evidence, dict):
+        return None, "the host proof is not valid k2oh-host-evidence output"
+    return evidence, None
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value
+
+
+def evidence_blockers(evidence, serial, now):
+    """Reasons the host proof does not show free ports (empty: it does)."""
+    if evidence.get("v") != EVIDENCE_VERSION:
+        return ["host proof version %r, expected %d" % (evidence.get("v"), EVIDENCE_VERSION)]
+    reasons = []
+    checked = evidence.get("checked_at")
+    if not _number(checked):
+        reasons.append("the host proof has no time")
+    elif checked > now + EVIDENCE_MAX_FUTURE:
+        reasons.append("the host proof is from the future (check the clocks)")
+    elif now - checked > EVIDENCE_MAX_AGE:
+        reasons.append("the host proof is %d s old (max %d s): make a new one"
+                       % (now - checked, EVIDENCE_MAX_AGE))
+    if evidence.get("root") is not True or evidence.get("fd_scan_complete") is not True:
+        reasons.append("the host proof did not inspect every process (run k2oh-host-evidence as root)")
+    service = evidence.get("klipper_service")
+    if service not in STOPPED_SERVICE_STATES:
+        reasons.append("the Klipper service on the host is %r, not stopped" % (service,))
+    procs = evidence.get("klippy_processes")
+    if not isinstance(procs, list):
+        reasons.append("the host proof does not list klippy.py processes")
+    elif procs:
+        reasons.append("klippy.py still runs on the host (pid %s)" % ", ".join(str(p) for p in procs))
+    ports = evidence.get("ports")
+    if not isinstance(ports, list):
+        reasons.append("the host proof does not list the gadget ports")
+        return reasons
+    if not serial:
+        reasons.append("the printer serial number is unknown, so the host ports cannot be matched")
+        return reasons
+    mine = [p for p in ports if isinstance(p, dict) and p.get("serial") == serial]
+    if not mine:
+        reasons.append("the host does not see this printer's gadget "
+                       "(another printer, or the USB link is down)")
+        return reasons
+    seen = sorted(str(p.get("interface")) for p in mine)
+    if seen != sorted(GADGET_INTERFACES):
+        reasons.append("the host sees interfaces %s of this printer's gadget, expected %s"
+                       % (", ".join(seen), ", ".join(GADGET_INTERFACES)))
+    for p in mine:
+        held = p.get("owners")
+        if not isinstance(held, list):
+            reasons.append("%s: owners unknown" % p.get("device"))
+        elif held:
+            reasons.append("%s is open on the host (pid %s)"
+                           % (p.get("device"), ", ".join(str(x) for x in held)))
+    return reasons
+
+
+def printer_serial():
+    # k2oh-gadget publishes the same value as the gadget's USB serial number.
+    return run(["get_sn_mac.sh", "sn"]).stdout.strip()
+
+
+def host_blockers(evidence_text, moonraker_url=None, now=None):
+    """(reasons, notes): the flash may go ahead only when reasons is empty."""
+    now = time.time() if now is None else now
+    url = moonraker_url or read_host_conf().get("MOONRAKER_URL")
+    moon = moonraker_state(url)
+    notes = ["external host Moonraker: %s (%s)" % (moon["status"], moon["detail"])]
+    reasons = []
+    if moon["status"] == "active":
+        reasons.append("Klipper on the external host is running (%s): stop it first" % moon["detail"])
+    elif moon["status"] != "stopped":
+        reasons.append("cannot confirm that Klipper on the external host is stopped: Moonraker %s (%s)"
+                       % (moon["status"], moon["detail"]))
+    evidence, problem = decode_evidence(evidence_text)
+    if problem:
+        reasons.append(problem)
+    else:
+        if _number(evidence.get("checked_at")):
+            notes.append("host proof from %s, %d s old"
+                         % (evidence.get("host", "?"), now - evidence["checked_at"]))
+        reasons.extend(evidence_blockers(evidence, printer_serial(), now))
+    return reasons, notes
 
 
 UUID_RE = re.compile(r"^(?:[0-9a-f]{2} ){11}[0-9a-f]{2}$")
@@ -616,27 +790,48 @@ def cfs_plan():
     return plan, notes
 
 
+class StepError(Exception):
+    pass
+
+
+def run_live(cmd, env=None):
+    """Run with output on the terminal; the exit code (127 if it cannot start)."""
+    try:
+        return subprocess.run(cmd, env=env).returncode
+    except OSError as exc:
+        print("k2oh-mcu-fw: %s: %s" % (cmd[0], exc), file=sys.stderr)
+        return 127
+
+
+def step(what, cmd, env=None):
+    code = run_live(cmd, env)
+    if code != 0:
+        raise StepError("%s failed (%s exited with %d)" % (what, cmd[0], code))
+
+
 def run_mcu_update(cfs=False):
     env = {k: v for k, v in os.environ.items() if k not in ("CFS", "FORCE")}
     if cfs:
         env["CFS"] = "1"
     print("power-cycling the MCU rail")
-    run(["/usr/bin/mcu_reset.sh"])
+    step("the MCU power cycle", ["/usr/bin/mcu_reset.sh"])
     print("running the stock mcu_update%s (this can take several minutes)" % (" for the CFS" if cfs else ""))
-    subprocess.run(["/etc/init.d/mcu_update", "start"], env=env)
+    step("the stock mcu_update" + (" for the CFS" if cfs else ""),
+         ["/etc/init.d/mcu_update", "start"], env)
 
 
 def cmd_apply(args):
     require_slot_b()
-    state = host_klipper_state(args.moonraker)
-    if state is None:
-        if not args.host_stopped:
-            die("stop Klipper on the external host first, then rerun with --host-stopped "
-                "(or set MOONRAKER_URL=http://<host>:7125 in %s)" % HOST_CONF)
-    elif state in ("ready", "startup"):
-        die("Klipper on the external host is %s: stop it first (sudo systemctl stop klipper)" % state)
-    else:
-        print("external host Klipper: %s" % state)
+    model = model_dir()
+    reasons, notes = host_blockers(args.host_evidence, args.moonraker)
+    for note in notes:
+        print(note)
+    if reasons:
+        die("not flashing:\n  - " + "\n  - ".join(reasons) + "\n"
+            "Stop Klipper on the external host, make a proof there with\n"
+            "  sudo k2oh-host-evidence\n"
+            "and pass it with --host-evidence (the installer helper does both).")
+    print("external host: Klipper stopped and this printer's ports free")
     print("This power-cycles the printer's MCUs and flashes every board whose version differs")
     print("from the files in %s (%s)." % (FW_ROOT, read_staged() or "slot B original"))
     if args.cfs:
@@ -648,15 +843,16 @@ def cmd_apply(args):
         if input("Type 'flash' to continue: ").strip() != "flash":
             die("cancelled")
     log_size = os.path.getsize("/tmp/mcu_update.log") if os.path.exists("/tmp/mcu_update.log") else 0
+    failures = []
     try:
         print("stopping the bridges")
-        run(["/etc/init.d/k2oh-bridge", "stop"])
+        step("stopping the bridges", ["/etc/init.d/k2oh-bridge", "stop"])
         if os.path.exists(CFS_JSON):
             os.unlink(CFS_JSON)
         run_mcu_update()
         if args.cfs:
-            plan, notes = cfs_plan()
-            for note in notes:
+            plan, cfs_notes = cfs_plan()
+            for note in cfs_notes:
                 print("  " + note)
             if plan:
                 for item in plan:
@@ -664,20 +860,33 @@ def cmd_apply(args):
                 with open(CFS_JSON, "w") as f:
                     json.dump({"CFSs": [{"uuid": i["uuid"], "fw": i["fw"]} for i in plan]}, f)
                 run_mcu_update(cfs=True)
-            elif not notes:
+            elif not cfs_notes:
                 print("  the stock tool reported no CFS in loader mode; nothing to flash")
+    except StepError as exc:
+        failures.append(str(exc))
     finally:
         if os.path.exists(CFS_JSON):
             os.unlink(CFS_JSON)
         print("starting the bridges")
-        run(["/etc/init.d/k2oh-bridge", "start"])
+        if run_live(["/etc/init.d/k2oh-bridge", "start"]) != 0:
+            failures.append("the bridges did not start again: run '/etc/init.d/k2oh-bridge start' "
+                            "or reboot the printer before starting Klipper")
     try:
         with open("/tmp/mcu_update.log") as f:
             f.seek(log_size)
             print(f.read())
     except OSError:
         pass
+    if not failures:
+        pending = ["%s %s %s" % (role, version, state)
+                   for role, version, state, target in board_plan(model)
+                   if target and target != version and not role.startswith("cfs@")]
+        if pending:
+            failures.append("boards still differ from their files after flashing: " + "; ".join(pending))
     cmd_status(args)
+    if failures:
+        die("the flash did not complete:\n  - " + "\n  - ".join(failures)
+            + "\nRead /tmp/mcu_update.log. Do not start Klipper until the boards answer.")
     print("Start Klipper on the external host again (FIRMWARE_RESTART or systemctl start klipper).")
 
 
@@ -722,8 +931,10 @@ def main():
     sub.add_parser("unstage")
     for name in ("apply", "update"):
         p = sub.add_parser(name)
-        p.add_argument("--host-stopped", action="store_true", help="Klipper on the external host is stopped")
-        p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+        p.add_argument("--host-evidence", metavar="PROOF",
+                       help="output of 'sudo k2oh-host-evidence' on the external host")
+        p.add_argument("--yes", action="store_true",
+                       help="do not ask for confirmation (the host checks still apply)")
         p.add_argument("--moonraker", metavar="URL", help="external host Moonraker, e.g. http://10.10.1.97:7125")
         p.add_argument("--cfs", action="store_true", help="also flash the CFS units (second pass)")
     args = parser.parse_args()

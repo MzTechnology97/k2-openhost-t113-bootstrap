@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Proof that this external host has released the K2-OpenHost gadget ports.
+
+Run it on the external host (the CM5) as root, after stopping Klipper:
+
+    sudo k2oh-host-evidence            # one base64 line for k2oh-mcu-fw
+    sudo k2oh-host-evidence --json     # the same, readable
+
+k2oh-mcu-fw on the printer accepts it with --host-evidence and refuses to
+flash unless:
+  * the Klipper service is inactive or failed, and no klippy.py process runs;
+  * all three ports of this printer's gadget (USB 0525:a4a6, serial number =
+    printer serial, interfaces 0, 1 and 2) are present on this host;
+  * no process holds any of them open;
+  * every /proc/<pid>/fd could be read (so an owner cannot hide), which is
+    why it needs root;
+  * the proof is recent.
+
+The output contains the printer serial. It only travels over SSH to the
+printer; do not paste it in public reports.
+"""
+
+import argparse
+import base64
+import glob
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+VERSION = 1
+GADGET_VID = "0525"
+GADGET_PID = "a4a6"
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def service_state(unit):
+    try:
+        out = subprocess.run(["systemctl", "is-active", unit], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return out.stdout.strip() or "unknown"
+
+
+def proc_entries():
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            yield pid
+
+
+def klippy_processes():
+    found = []
+    for pid in proc_entries():
+        raw = read_bytes("/proc/%s/cmdline" % pid)
+        if raw is None:
+            continue
+        argv = [a.decode(errors="replace") for a in raw.split(b"\0") if a]
+        if any(os.path.basename(a) == "klippy.py" for a in argv):
+            found.append(int(pid))
+    return found
+
+
+def read_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def gadget_ports():
+    """tty devices whose USB device is the K2-OpenHost gadget."""
+    ports = []
+    for tty in sorted(glob.glob("/sys/class/tty/*")):
+        dev = os.path.realpath(os.path.join(tty, "device"))
+        if not os.path.exists(dev):
+            continue
+        # The USB interface is the first ancestor with bInterfaceNumber,
+        # the USB device the first with idVendor.
+        iface = usb = None
+        node = dev
+        while node and node != "/":
+            if iface is None and os.path.exists(os.path.join(node, "bInterfaceNumber")):
+                iface = node
+            if os.path.exists(os.path.join(node, "idVendor")):
+                usb = node
+                break
+            node = os.path.dirname(node)
+        if not usb or not iface:
+            continue
+        if read(os.path.join(usb, "idVendor")) != GADGET_VID or \
+                read(os.path.join(usb, "idProduct")) != GADGET_PID:
+            continue
+        ports.append({
+            "device": "/dev/" + os.path.basename(tty),
+            "serial": read(os.path.join(usb, "serial")) or "",
+            "interface": read(os.path.join(iface, "bInterfaceNumber")) or "",
+        })
+    return ports
+
+
+def owners(devices):
+    """{device: [pid, ...]} and whether every process could be inspected."""
+    result = {d: [] for d in devices}
+    real = {os.path.realpath(d): d for d in devices}
+    complete = True
+    me = str(os.getpid())
+    for pid in proc_entries():
+        if pid == me:
+            continue
+        fd_dir = "/proc/%s/fd" % pid
+        try:
+            fds = os.listdir(fd_dir)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            complete = False
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if target in real:
+                result[real[target]].append(int(pid))
+    return result, complete
+
+
+def collect(unit):
+    ports = gadget_ports()
+    held, complete = owners([p["device"] for p in ports])
+    for p in ports:
+        p["owners"] = sorted(set(held[p["device"]]))
+    return {
+        "v": VERSION,
+        "checked_at": int(time.time()),
+        "host": socket.gethostname(),
+        "root": os.geteuid() == 0,
+        "klipper_service": service_state(unit),
+        "klippy_processes": klippy_processes(),
+        "fd_scan_complete": complete,
+        "ports": ports,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--json", action="store_true", help="print readable JSON")
+    parser.add_argument("--service", default="klipper", help="Klipper systemd unit (default: klipper)")
+    args = parser.parse_args()
+    evidence = collect(args.service)
+    if args.json:
+        print(json.dumps(evidence, indent=2, sort_keys=True))
+    else:
+        raw = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+        print(base64.b64encode(raw).decode())
+    if not evidence["root"]:
+        print("k2oh-host-evidence: not root, so other users' processes cannot be checked;"
+              " k2oh-mcu-fw will refuse this proof", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
