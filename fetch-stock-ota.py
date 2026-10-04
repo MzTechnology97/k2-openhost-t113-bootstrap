@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Download a stock Creality K2 Pro OTA image and unpack its kernel and rootfs.
 
-    fetch-stock-ota.py VERSION OUTDIR [--board CR0CN200400C10]
+    fetch-stock-ota.py VERSION|latest OUTDIR [--board CR0CN200400C10]
+    fetch-stock-ota.py --list [--board CR0CN200400C10]
 
 The image comes from Creality's public firmware index and CDN (the same
 source k2oh-mcu-fw uses on the printer). The kernel and rootfs members are
 checked against the image's own cpio_item_md5 list, written to OUTDIR as
-"kernel" and "rootfs", and the image is deleted.
+"kernel" and "rootfs" (plus "VERSION"), and the image is deleted. --list
+prints the releases in the index, oldest first.
 """
 
 import argparse
@@ -30,13 +32,23 @@ def load_tool():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("version")
-    parser.add_argument("outdir")
+    parser.add_argument("version", nargs="?")
+    parser.add_argument("outdir", nargs="?")
     parser.add_argument("--board", default="CR0CN200400C10")
+    parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
     tool = load_tool()
 
-    releases = {r["version"]: r for r in tool.search_releases(args.board)}
+    ordered = tool.search_releases(args.board)
+    if args.list:
+        for r in ordered:
+            print(r["version"])
+        return
+    if not (args.version and args.outdir):
+        parser.error("VERSION and OUTDIR are required")
+    releases = {r["version"]: r for r in ordered}
+    if args.version == "latest" and ordered:
+        args.version = ordered[-1]["version"]
     if args.version not in releases:
         sys.exit("version %s is not in Creality's index (found: %s)"
                  % (args.version, ", ".join(sorted(releases, key=tool.version_key))))
@@ -67,6 +79,8 @@ def main():
                         out.write(chunk)
                         left -= len(chunk)
                 print("%s: %d bytes, MD5 ok" % (name, size))
+        with open(os.path.join(args.outdir, "VERSION"), "w") as out:
+            out.write(args.version + "\n")
     finally:
         os.unlink(image)
 

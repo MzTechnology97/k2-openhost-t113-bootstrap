@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Build the K2-OpenHost slot B image for the Creality K2 Pro T113.
 #
-# Input: the "kernel" and "rootfs" files of the stock Creality OTA image that
-# slot A runs (unpacked from the .img, a cpio archive), by default 1.1.0.94.
+# Input: the "kernel" and "rootfs" files of a stock Creality K2 Pro OTA image
+# (unpacked from the .img, a cpio archive; fetch-stock-ota.py does it).
+# Prepared and tested on 1.1.0.94. Newer releases build when the files the
+# changes depend on are unchanged (checked below), but booting slot B and
+# the T113 USB gadget (OTG) mode are not guaranteed on them.
 # Output (in --out): bootB.img, rootfsB.squashfs, SHA256SUMS, manifest.txt,
 # k2oh-slot and install-slot-b.sh: copy that directory to the printer.
 #
@@ -15,8 +18,9 @@
 #     USB-stick OTA disabled (an OTA started from slot B would overwrite A).
 #
 # Needs: bash, fakeroot, unsquashfs and mksquashfs (squashfs-tools), sha256sum.
-#   ./build-slot-b.sh --kernel kernel --rootfs rootfs --out out
-#   (--tools DIR: directory holding unsquashfs/mksquashfs)
+#   ./build-slot-b.sh --kernel kernel --rootfs rootfs --out out [--base-version V]
+#   (--tools DIR: directory holding unsquashfs/mksquashfs;
+#    --force-preinit: build even if the stock preinit scripts changed)
 
 set -euo pipefail
 
@@ -25,22 +29,30 @@ VERSION="$(cat "$HERE/VERSION")"
 ROOTFS_PART_BYTES=314572800   # rootfsB, 300 MiB
 BOOT_PART_BYTES=16777216      # bootB, 16 MiB
 
-# Stock images this build is validated against (OTA 1.1.0.94, cpio_item_md5).
-KNOWN_KERNEL_MD5="42ced67cb382d6919737a15aab658ff6"
-KNOWN_ROOTFS_MD5="ea8da1a09c56eb33175822f840cb7fa2"
+# Stock releases the work was prepared and tested on (kernel/rootfs MD5 from
+# the OTA's cpio_item_md5). Other releases build with a warning.
+TESTED_BASES="1.1.0.94:42ced67cb382d6919737a15aab658ff6:ea8da1a09c56eb33175822f840cb7fa2"
+
+# Slot B replaces 80_mount_root and trims 79_format_partition. Both are
+# identical in 1.1.0.94 and 1.1.7.0; a release that changes them needs a
+# review before slot B can be built from it.
+PREINIT_SHA256="01f37a5623b907a549af30a087927f9135442e461639caf43740dbdab72dbc9b  lib/preinit/80_mount_root
+56a5345e53f16a89f8be93747c2812d0bed1755decd21b7c53e5c3dc37482b98  lib/preinit/79_format_partition"
 
 # Init scripts disabled in slot B (their /etc/rc.d links are removed).
 # wipe_data is the factory reset: it deletes most of UDISK, which slot A uses.
 DISABLED_SERVICES="klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data S99swupdate_autorun"
 
-kernel="" rootfs="" out="" tools="" allow_other=0
+kernel="" rootfs="" out="" tools="" base_version="" force_preinit=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--kernel) kernel="$2"; shift 2 ;;
 	--rootfs) rootfs="$2"; shift 2 ;;
 	--out) out="$2"; shift 2 ;;
 	--tools) tools="$2"; shift 2 ;;
-	--allow-other-base) allow_other=1; shift ;;
+	--base-version) base_version="$2"; shift 2 ;;
+	--force-preinit) force_preinit=1; shift ;;
+	--allow-other-base) shift ;;   # accepted for compatibility; other bases only warn now
 	-h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
@@ -58,10 +70,19 @@ say "Checking the stock images"
 [ "$(head -c 4 "$rootfs")" = "hsqs" ] || { echo "$rootfs is not a squashfs image" >&2; exit 1; }
 kernel_md5="$(md5sum "$kernel" | cut -d' ' -f1)"
 rootfs_md5="$(md5sum "$rootfs" | cut -d' ' -f1)"
-if [ "$kernel_md5" != "$KNOWN_KERNEL_MD5" ] || [ "$rootfs_md5" != "$KNOWN_ROOTFS_MD5" ]; then
-	echo "These are not the stock 1.1.0.94 images this build was validated with." >&2
-	echo "  kernel md5 $kernel_md5, rootfs md5 $rootfs_md5" >&2
-	[ "$allow_other" = 1 ] || { echo "Use --allow-other-base to build anyway." >&2; exit 1; }
+tested=""
+for entry in $TESTED_BASES; do
+	[ "${entry#*:}" = "$kernel_md5:$rootfs_md5" ] && tested="${entry%%:*}"
+done
+if [ -n "$tested" ]; then
+	echo "stock $tested: the release this work was prepared and tested on"
+	base_version="${base_version:-$tested}"
+else
+	{
+		printf '\033[1;33mWARNING: stock %s is not the release this work was tested on (1.1.0.94).\n' "${base_version:-release}"
+		printf 'Slot B is built only if the files it changes are identical, but booting it and the\n'
+		printf 'T113 USB gadget (OTG) mode are NOT guaranteed on this firmware.\033[0m\n'
+	} >&2
 fi
 
 mkdir -p "$out"
@@ -72,6 +93,14 @@ root="$work/root"
 
 say "Unpacking the stock rootfs"
 fakeroot -s "$state" unsquashfs -q -no-progress -d "$root" "$rootfs" >/dev/null
+
+say "Checking the stock boot scripts slot B changes"
+if ! (cd "$root" && printf '%s\n' "$PREINIT_SHA256" | sha256sum -c --quiet - >/dev/null 2>&1); then
+	echo "The stock preinit scripts differ from the reviewed ones (80_mount_root, 79_format_partition)." >&2
+	echo "Slot B replaces them, so building from this release needs a review first." >&2
+	[ "$force_preinit" = 1 ] || exit 1
+	echo "--force-preinit given: building anyway" >&2
+fi
 
 say "Applying the K2-OpenHost changes"
 cat > "$work/apply.sh" <<'APPLY'
@@ -116,8 +145,9 @@ sed -i -e '/^[[:space:]]*clean_parts$/d' -e '/^[[:space:]].*do_check_format \/de
 chmod 0755 "$root/etc/dropbear"
 printf '%s\n' "$release" > "$root/etc/k2openhost-release"
 APPLY
-release="$(printf 'version=%s\nbuilt=%s\nbase_kernel_md5=%s\nbase_rootfs_md5=%s' \
-	"$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$kernel_md5" "$rootfs_md5")"
+release="$(printf 'version=%s\nbuilt=%s\nbase_version=%s\nbase_tested=%s\nbase_kernel_md5=%s\nbase_rootfs_md5=%s' \
+	"$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${base_version:-unknown}" \
+	"$([ -n "$tested" ] && echo yes || echo no)" "$kernel_md5" "$rootfs_md5")"
 fakeroot -i "$state" -s "$state" bash "$work/apply.sh" "$root" "$HERE/rootfs" "$DISABLED_SERVICES" "$release"
 
 say "Checking the result"
