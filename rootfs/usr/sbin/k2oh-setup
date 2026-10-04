@@ -1,0 +1,180 @@
+#!/usr/bin/python3
+"""K2-OpenHost slot B setup: point the T113 at the external host.
+
+    k2oh-setup                 apply /mnt/UDISK/.k2openhost/k2openhost.conf
+    k2oh-setup --host IP       change the external host and apply
+    k2oh-setup status          show the configuration
+
+The configuration is written by the host installer (helper.sh, T113 menu):
+
+    HOST_IP=192.168.1.50
+    MOONRAKER_PORT=7125
+    HELIX_ARCHIVE=/mnt/UDISK/.k2openhost/setup/helixscreen-k2-v1.0.2.tar.gz
+    HELIX_INSTALLER=/mnt/UDISK/.k2openhost/setup/helixscreen-install.sh
+
+Applying it installs HelixScreen from the local archive (once) and points it
+at Moonraker on the external host; k2oh-mcu-fw reads the same file to check
+that Klipper on the host is stopped before flashing. The first boot of slot
+B runs this automatically (/etc/init.d/k2oh-firstboot).
+"""
+
+import ipaddress
+import json
+import os
+import subprocess
+import sys
+import time
+
+K2OH_DIR = "/mnt/UDISK/.k2openhost"
+CONF = os.path.join(K2OH_DIR, "k2openhost.conf")
+DONE = os.path.join(K2OH_DIR, "setup.done")
+HELIX_SETTINGS = (
+    "/mnt/UDISK/helixscreen/config/settings.json",
+    "/opt/helixscreen/config/settings.json",
+    "/mnt/UDISK/printer_data/config/helixscreen/settings.json",
+)
+HELIX_INIT = "/etc/init.d/S99helixscreen"
+
+
+def log(msg):
+    print("%s k2oh-setup: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
+
+
+def read_conf():
+    conf = {}
+    try:
+        with open(CONF) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    conf[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return conf
+
+
+def write_conf(conf):
+    os.makedirs(K2OH_DIR, exist_ok=True)
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("# K2-OpenHost slot B configuration (k2oh-setup)\n")
+        for key in sorted(conf):
+            f.write("%s=%s\n" % (key, conf[key]))
+    os.replace(tmp, CONF)
+
+
+def valid_host(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return all(c.isalnum() or c in ".-" for c in value) and 0 < len(value) < 254
+
+
+def helix_installed():
+    return os.path.exists(HELIX_INIT) or any(os.path.exists(p) for p in HELIX_SETTINGS)
+
+
+def install_helix(conf):
+    archive = conf.get("HELIX_ARCHIVE", "")
+    installer = conf.get("HELIX_INSTALLER", "")
+    if helix_installed():
+        log("HelixScreen is already installed")
+        return True
+    if not archive:
+        log("no HelixScreen archive prepared; skipping")
+        return True
+    if not (os.path.isfile(archive) and os.path.isfile(installer)):
+        log("HelixScreen archive or installer missing: %s, %s" % (archive, installer))
+        return False
+    log("installing HelixScreen from %s" % os.path.basename(archive))
+    result = subprocess.run(["sh", installer, "--local", archive, "--skip-kiauh-registration"],
+                            stdin=subprocess.DEVNULL)
+    if result.returncode != 0:
+        log("HelixScreen installer failed (exit %d)" % result.returncode)
+        return False
+    return True
+
+
+def point_helix(host, port):
+    changed = False
+    for path in HELIX_SETTINGS:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        active = data.get("active_printer_id") or "default"
+        data["active_printer_id"] = active
+        printers = data.setdefault("printers", {})
+        printer = printers.setdefault(active, {})
+        printer["moonraker_host"] = host
+        printer["moonraker_port"] = int(port)
+        tmp = path + ".k2oh"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+        log("HelixScreen now uses Moonraker at %s:%s (%s)" % (host, port, path))
+        changed = True
+    if changed and os.path.exists(HELIX_INIT):
+        subprocess.run([HELIX_INIT, "restart"], stdin=subprocess.DEVNULL)
+    elif not changed:
+        log("HelixScreen settings not found yet; it will ask for the host in its setup wizard")
+    return changed
+
+
+def apply(conf):
+    host = conf.get("HOST_IP", "")
+    port = conf.get("MOONRAKER_PORT", "7125")
+    if not valid_host(host):
+        log("HOST_IP is missing or invalid in %s" % CONF)
+        return 1
+    if conf.get("MOONRAKER_URL") != "http://%s:%s" % (host, port):
+        conf["MOONRAKER_URL"] = "http://%s:%s" % (host, port)
+        write_conf(conf)
+    log("external host: %s (Moonraker %s)" % (host, conf["MOONRAKER_URL"]))
+    helix_ok = install_helix(conf)
+    point_helix(host, port)
+    if not helix_ok:
+        log("setup incomplete: HelixScreen is retried at the next boot (or run k2oh-setup)")
+        return 1
+    with open(DONE, "w") as f:
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%S\n"))
+    log("done")
+    return 0
+
+
+def main():
+    if os.geteuid() != 0:
+        print("k2oh-setup: run as root", file=sys.stderr)
+        return 1
+    args = sys.argv[1:]
+    conf = read_conf()
+    if args[:1] == ["status"]:
+        print("Configuration : %s" % (CONF if conf else "missing"))
+        for key in sorted(conf):
+            print("  %s=%s" % (key, conf[key]))
+        print("Setup         : %s" % ("done" if os.path.exists(DONE) else "pending"))
+        print("HelixScreen   : %s" % ("installed" if helix_installed() else "not installed"))
+        return 0
+    if args[:1] == ["--host"] and len(args) == 2:
+        if not valid_host(args[1]):
+            print("k2oh-setup: invalid host %r" % args[1], file=sys.stderr)
+            return 2
+        conf["HOST_IP"] = args[1]
+        conf.setdefault("MOONRAKER_PORT", "7125")
+        write_conf(conf)
+    elif args:
+        print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
+        return 2
+    return apply(conf)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

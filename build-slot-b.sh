@@ -77,21 +77,26 @@ say "Applying the K2-OpenHost changes"
 cat > "$work/apply.sh" <<'APPLY'
 set -euo pipefail
 root="$1" src="$2" disabled="$3" release="$4"
-cp -a "$src/." "$root/"
-chown -R 0:0 "$root/etc/init.d/k2oh-gadget" "$root/etc/init.d/k2oh-bridge" \
-	"$root/usr/bin/k2oh-bridge" "$root/usr/bin/k2oh-mcu-fw" "$root/usr/sbin/k2oh-slot" \
-	"$root/usr/bin/chamber_cam_power.sh" "$root/lib/preinit/80_mount_root"
-chmod 0755 "$root/etc/init.d/k2oh-gadget" "$root/etc/init.d/k2oh-bridge" \
-	"$root/usr/bin/k2oh-bridge" "$root/usr/bin/k2oh-mcu-fw" "$root/usr/sbin/k2oh-slot" \
-	"$root/usr/bin/chamber_cam_power.sh"
-chmod 0644 "$root/lib/preinit/80_mount_root"
+(cd "$src" && tar -cf - --exclude=__pycache__ --exclude='*.pyc' .) | (cd "$root" && tar -xf -)
+(cd "$src" && find . -name __pycache__ -prune -o -type f ! -name '*.pyc' -print) | while read -r f; do
+	chown 0:0 "$root/$f"
+	case "$f" in
+	./etc/init.d/*|./usr/bin/*|./usr/sbin/*) chmod 0755 "$root/$f" ;;
+	*) chmod 0644 "$root/$f" ;;
+	esac
+done
 for svc in $disabled; do
 	rm -f "$root"/etc/rc.d/[SK][0-9][0-9]"${svc#S99}"
 done
+# Wi-Fi after network (S20), gadget and bridges after mcu_update (S13) and
+# board_init (S20), first-boot setup last.
+ln -sf ../init.d/k2oh-wifi "$root/etc/rc.d/S22k2oh-wifi"
+ln -sf ../init.d/k2oh-wifi "$root/etc/rc.d/K89k2oh-wifi"
 ln -sf ../init.d/k2oh-gadget "$root/etc/rc.d/S55k2oh-gadget"
 ln -sf ../init.d/k2oh-gadget "$root/etc/rc.d/K11k2oh-gadget"
 ln -sf ../init.d/k2oh-bridge "$root/etc/rc.d/S56k2oh-bridge"
 ln -sf ../init.d/k2oh-bridge "$root/etc/rc.d/K10k2oh-bridge"
+ln -sf ../init.d/k2oh-firstboot "$root/etc/rc.d/S99k2oh-firstboot"
 # rootfs_data belongs to slot A: do not let block-mount attach it to /overlay.
 # block-mount must not run e2fsck on UDISK either.
 awk -v q="'" '
@@ -120,6 +125,9 @@ for svc in klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data swupdat
 	if ls "$root"/etc/rc.d/ | grep -qx "[SK][0-9][0-9]$svc"; then
 		echo "service $svc is still enabled" >&2; exit 1
 	fi
+done
+for bin in usr/sbin/wpa_supplicant sbin/udhcpc usr/bin/python3 usr/bin/mcu_util usr/bin/mcu_util_485 usr/bin/mcu_reset.sh; do
+	[ -e "$root/$bin" ] || [ -L "$root/$bin" ] || { echo "the stock rootfs has no /$bin" >&2; exit 1; }
 done
 grep -A4 "target.*'/overlay'" "$root/etc/config/fstab" | grep -q "enabled.*'0'" \
 	|| { echo "the rootfs_data overlay is still enabled in /etc/config/fstab" >&2; exit 1; }

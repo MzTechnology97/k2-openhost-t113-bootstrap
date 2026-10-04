@@ -7,7 +7,7 @@
                                       only its MCU/motor/CFS firmware files
     k2oh-mcu-fw stage VERSION         install a downloaded set in slot B
     k2oh-mcu-fw unstage               go back to slot B's original files
-    k2oh-mcu-fw apply                 flash now with the stock Creality tools
+    k2oh-mcu-fw apply [--cfs]         flash now with the stock Creality tools
 
 The OTA image is read from Creality's public firmware index and downloaded
 from its CDN. Only /usr/share/klipper/fw/<model> and /usr/share/klipper/fw/cfs
@@ -16,10 +16,12 @@ are kept (checked against the image's own MD5 list); the image is deleted.
 Flashing uses Creality's own sequence: stop the bridges, power-cycle the MCU
 rail (mcu_reset.sh), run /etc/init.d/mcu_update (mcu_util + mcu_util_485),
 start the bridges again. The stock script flashes every board whose version
-differs from its file and also runs at every boot of slot B. The CFS is not
-flashed: the stock path needs /tmp/cfs_update.json, written by Creality's OTA
-server, whose content is not reproduced here. Slot A flashes its own files
-back at its next boot.
+differs from its file and also runs at every boot of slot B. With --cfs a
+second pass flashes the CFS the way Creality's OTA server does: it writes
+/tmp/cfs_update.json ({"CFSs": [{"uuid": ..., "fw": ...}]}, the format
+mcu_util_485 reads) for the units the first pass reported in loader mode,
+then power-cycles and runs mcu_update with CFS=1. Slot A flashes its own
+files back at its next boot.
 """
 
 import argparse
@@ -40,7 +42,7 @@ import zlib
 K2OH_DIR = "/mnt/UDISK/.k2openhost"
 LIBRARY = os.path.join(K2OH_DIR, "mcu-fw")
 STAGED_FILE = os.path.join(LIBRARY, "staged")
-HOST_CONF = os.path.join(K2OH_DIR, "host.conf")
+HOST_CONF = os.path.join(K2OH_DIR, "k2openhost.conf")
 FW_ROOT = os.environ.get("K2OH_FW_ROOT", "/usr/share/klipper/fw")
 ORIG_FW_ROOT = os.environ.get("K2OH_ORIG_FW_ROOT", "/rom/usr/share/klipper/fw")
 SEARCH_URL = "https://www.crealitycloud.com/api/cxy/search/firmwareSoftwareSearch"
@@ -63,17 +65,23 @@ def run(cmd):
 
 def board_name():
     out = run(["fw_printenv", "-n", "board"]).stdout.strip()
-    return out if re.fullmatch(r"[A-Z0-9]+", out or "") else DEFAULT_BOARD
+    if not out and "K2OH_FW_ROOT" in os.environ:
+        return DEFAULT_BOARD
+    if out != DEFAULT_BOARD:
+        die("this is not a Creality K2 Pro board (%r, expected %s)" % (out, DEFAULT_BOARD))
+    return out
+
+
+K2_PRO_MODEL = "F012"
 
 
 def model_dir():
-    """Firmware directory the stock mcu_update picks for this model."""
+    """Firmware directory for this printer. Only the K2 Pro (F012) is
+    supported, even though the stock script reuses F012 for other models."""
     model = run(["get_sn_mac.sh", "model"]).stdout.strip()
-    if model in ("F012", "F021", "F025") or not model:
-        return "F012"
-    if model == "F008":
-        return "F008"
-    die("unsupported printer model %r" % model)
+    if model == K2_PRO_MODEL or (not model and "K2OH_FW_ROOT" in os.environ):
+        return K2_PRO_MODEL
+    die("this is not a Creality K2 Pro (model %r, expected %s)" % (model, K2_PRO_MODEL))
 
 
 def version_key(version):
@@ -466,7 +474,7 @@ def cmd_status(_args):
         else:
             state = "several files for %s (stock skips it)" % hw
         print("  %-12s %-28s %s" % (role, version or "?", state))
-    print("The CFS is not flashed by 'apply'.")
+    print("The CFS is flashed only by 'apply --cfs'.")
 
 
 def cmd_download(args):
@@ -551,6 +559,57 @@ def host_klipper_state(url=None):
         return "unreachable (%s)" % exc
 
 
+UUID_RE = re.compile(r"^(?:[0-9a-f]{2} ){11}[0-9a-f]{2}$")
+CFS_JSON = "/tmp/cfs_update.json"
+RS485_VERSIONS = "/tmp/.485_mcu_version"
+
+
+def cfs_plan():
+    """CFS units to flash, from the stock tool's own discovery output.
+
+    mcu_util_485 writes each unit it found in loader mode to
+    /tmp/.485_mcu_version with its UniID ("uuid", 12 bytes as lowercase hex
+    separated by spaces) and its loader identity ("version",
+    <boot>-<application>, e.g. cfs0_050_G32-cfs0_000_113). The file is picked
+    by the exact boot/hardware token, never guessed.
+    """
+    try:
+        with open(RS485_VERSIONS) as f:
+            units = json.load(f).get("CFSs") or []
+    except (OSError, ValueError):
+        units = []
+    plan, notes = [], []
+    cfs_dir = os.path.join(FW_ROOT, "cfs")
+    for unit in units:
+        uuid_text = str(unit.get("uuid", "")).strip().lower()
+        version = str(unit.get("version", ""))
+        boot, _, app = version.partition("-")
+        if not UUID_RE.match(uuid_text) or not boot:
+            notes.append("skipped a CFS with unreadable identity (%r)" % version)
+            continue
+        files = sorted(n for n in os.listdir(cfs_dir) if n.startswith(boot + "-") and n.endswith(".bin"))             if os.path.isdir(cfs_dir) else []
+        if len(files) != 1:
+            notes.append("CFS %s: %d files for %s, not flashed" % (version, len(files), boot))
+            continue
+        target = files[0][:-4]
+        if target == version:
+            notes.append("CFS %s is up to date" % version)
+            continue
+        plan.append({"uuid": uuid_text, "fw": os.path.join(cfs_dir, files[0]),
+                     "from": version, "to": target})
+    return plan, notes
+
+
+def run_mcu_update(cfs=False):
+    env = {k: v for k, v in os.environ.items() if k not in ("CFS", "FORCE")}
+    if cfs:
+        env["CFS"] = "1"
+    print("power-cycling the MCU rail")
+    run(["/usr/bin/mcu_reset.sh"])
+    print("running the stock mcu_update%s (this can take several minutes)" % (" for the CFS" if cfs else ""))
+    subprocess.run(["/etc/init.d/mcu_update", "start"], env=env)
+
+
 def cmd_apply(args):
     require_slot_b()
     state = host_klipper_state(args.moonraker)
@@ -563,7 +622,12 @@ def cmd_apply(args):
     else:
         print("external host Klipper: %s" % state)
     print("This power-cycles the printer's MCUs and flashes every board whose version differs")
-    print("from the files in %s (%s). The CFS is not flashed." % (FW_ROOT, read_staged() or "slot B original"))
+    print("from the files in %s (%s)." % (FW_ROOT, read_staged() or "slot B original"))
+    if args.cfs:
+        print("With --cfs, a second pass flashes the CFS units the stock tool reports, using")
+        print("the file that matches each unit's exact boot/hardware token.")
+    else:
+        print("The CFS is not flashed (add --cfs).")
     if not args.yes:
         if input("Type 'flash' to continue: ").strip() != "flash":
             die("cancelled")
@@ -571,12 +635,24 @@ def cmd_apply(args):
     try:
         print("stopping the bridges")
         run(["/etc/init.d/k2oh-bridge", "stop"])
-        print("power-cycling the MCU rail")
-        run(["/usr/bin/mcu_reset.sh"])
-        print("running the stock mcu_update (this can take several minutes)")
-        env = {k: v for k, v in os.environ.items() if k not in ("CFS", "FORCE")}
-        subprocess.run(["/etc/init.d/mcu_update", "start"], env=env)
+        if os.path.exists(CFS_JSON):
+            os.unlink(CFS_JSON)
+        run_mcu_update()
+        if args.cfs:
+            plan, notes = cfs_plan()
+            for note in notes:
+                print("  " + note)
+            if plan:
+                for item in plan:
+                    print("  CFS %s -> %s" % (item["from"], item["to"]))
+                with open(CFS_JSON, "w") as f:
+                    json.dump({"CFSs": [{"uuid": i["uuid"], "fw": i["fw"]} for i in plan]}, f)
+                run_mcu_update(cfs=True)
+            elif not notes:
+                print("  the stock tool reported no CFS in loader mode; nothing to flash")
     finally:
+        if os.path.exists(CFS_JSON):
+            os.unlink(CFS_JSON)
         print("starting the bridges")
         run(["/etc/init.d/k2oh-bridge", "start"])
     try:
@@ -603,6 +679,7 @@ def main():
     p.add_argument("--host-stopped", action="store_true", help="Klipper on the external host is stopped")
     p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     p.add_argument("--moonraker", metavar="URL", help="external host Moonraker, e.g. http://10.10.1.97:7125")
+    p.add_argument("--cfs", action="store_true", help="also flash the CFS units (second pass)")
     args = parser.parse_args()
     if os.geteuid() != 0 and args.cmd in ("download", "stage", "unstage", "apply"):
         die("run as root")
