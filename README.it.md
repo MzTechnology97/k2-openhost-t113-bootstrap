@@ -19,7 +19,7 @@ Questo repository fa parte di [K2-OpenHost](https://github.com/MzTechnology97/K2
 | **k2-openhost-t113-bootstrap** (questo) | Il lato stampante: il sistema dello slot B per il T113, il suo installer, `k2oh-slot`, `k2oh-setup`, `k2oh-mcu-fw`. |
 | [k2-openhost-installer-helper](https://github.com/MzTechnology97/k2-openhost-installer-helper) | L'host esterno. Il suo menu (sezione T113) clona questo repository ed esegue tutto il bootstrap via SSH. |
 | [kalico-k2pro](https://github.com/MzTechnology97/kalico-k2pro) | Kalico per la K2 Pro sull'host esterno. |
-| [k2-pro-custom-firmware](https://github.com/MzTechnology97/k2-pro-custom-firmware) | Fork del firmware K2 di Jacob10383: sorgente e storia degli extra K2; rimanda qui per il lato T113 di OpenHost. |
+| [k2-pro-custom-firmware](https://github.com/MzTechnology97/k2-pro-custom-firmware) | Archiviato (4 ottobre 2026): storia delle prime modifiche K2 Pro/OpenHost agli extra K2 di Jacob10383, ora mantenuti in kalico-k2pro. |
 | [k2-openhost-firmware-tools](https://github.com/MzTechnology97/k2-openhost-firmware-tools) | Ricerca sul firmware delle periferiche e sonde in sola lettura (protocolli, formato di `cfs_update.json`). |
 
 Il bootstrap trasforma la scheda T113 della stampante in un bridge K2-OpenHost pronto all'uso:

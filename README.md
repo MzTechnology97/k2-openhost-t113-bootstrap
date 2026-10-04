@@ -19,7 +19,7 @@ This repository is part of [K2-OpenHost](https://github.com/MzTechnology97/K2-Op
 | **k2-openhost-t113-bootstrap** (this one) | The printer side: the slot B system for the T113, its installer, `k2oh-slot`, `k2oh-setup`, `k2oh-mcu-fw`. |
 | [k2-openhost-installer-helper](https://github.com/MzTechnology97/k2-openhost-installer-helper) | The external host. Its menu (T113 section) clones this repository and runs the whole bootstrap over SSH. |
 | [kalico-k2pro](https://github.com/MzTechnology97/kalico-k2pro) | Kalico for the K2 Pro on the external host. |
-| [k2-pro-custom-firmware](https://github.com/MzTechnology97/k2-pro-custom-firmware) | Fork of Jacob10383's K2 firmware: K2 extras source and history; links here for the OpenHost T113 side. |
+| [k2-pro-custom-firmware](https://github.com/MzTechnology97/k2-pro-custom-firmware) | Archived (2026-10-04): history of the first K2 Pro/OpenHost changes to Jacob10383's K2 extras, now maintained in kalico-k2pro. |
 | [k2-openhost-firmware-tools](https://github.com/MzTechnology97/k2-openhost-firmware-tools) | Peripheral firmware research and read-only probes (protocols, `cfs_update.json` format). |
 
 This turns the printer's T113 board into a ready K2-OpenHost bridge: USB gadget with the three K2 buses, HelixScreen on the printer screen talking to Moonraker on your external host, and a manual tool for Creality MCU, motor and CFS firmware updates. It goes into **slot B**. **Slot A**, the system the printer runs today, is never written and stays one command or one power cycle away.
