@@ -1,0 +1,57 @@
+#!/bin/sh /etc/rc.common
+# K2-OpenHost: put USB0 in device mode and expose three Generic Serial
+# functions to the external host (ttyGS0..2 -> host ttyUSB0..2).
+#
+# 0525:a4a6 is the Linux "Gadget Serial" ID the host udev rules match;
+# interfaces 00/01/02 are Main MCU, Nozzle MCU and RS-485/CFS.
+
+START=55
+STOP=11
+
+G=/sys/kernel/config/usb_gadget/g1
+
+otg_dir() {
+	ls -d /sys/devices/platform/soc*/*usbc0* 2>/dev/null | head -n 1
+}
+
+device_mode() {
+	local dir role
+	dir=$(otg_dir)
+	[ -n "$dir" ] || { echo "k2oh-gadget: OTG manager not found" >&2; return 1; }
+	role=$(cat "$dir/otg_role" 2>/dev/null)
+	[ "$role" = "usb_device" ] && return 0
+	# Reading usb_device is how the Allwinner OTG manager switches role.
+	cat "$dir/usb_device" >/dev/null
+	sleep 1
+	role=$(cat "$dir/otg_role" 2>/dev/null)
+	[ "$role" = "usb_device" ] || { echo "k2oh-gadget: OTG role is '$role'" >&2; return 1; }
+}
+
+start() {
+	device_mode || return 1
+	grep -q " /sys/kernel/config " /proc/mounts || mount -t configfs none /sys/kernel/config
+
+	[ -e "$G/UDC" ] && [ -n "$(cat "$G/UDC" 2>/dev/null)" ] && echo "" > "$G/UDC"
+
+	mkdir -p "$G/strings/0x409" "$G/configs/c.1/strings/0x409"
+	echo 0x0525 > "$G/idVendor"
+	echo 0xa4a6 > "$G/idProduct"
+	echo "Creality K2 Pro" > "$G/strings/0x409/manufacturer"
+	echo "K2-OpenHost Gadget Serial" > "$G/strings/0x409/product"
+	echo "$(get_sn_mac.sh sn 2>/dev/null)" > "$G/strings/0x409/serialnumber"
+	echo 0xc0 > "$G/configs/c.1/bmAttributes"
+	echo 500 > "$G/configs/c.1/MaxPower"
+	echo "K2-OpenHost" > "$G/configs/c.1/strings/0x409/configuration"
+
+	# Link order sets the interface numbers seen by the host.
+	for n in 0 1 2; do
+		mkdir -p "$G/functions/gser.usb$n"
+		[ -e "$G/configs/c.1/gser.usb$n" ] || ln -s "$G/functions/gser.usb$n" "$G/configs/c.1/gser.usb$n"
+	done
+
+	echo "$(ls /sys/class/udc | head -n 1)" > "$G/UDC"
+}
+
+stop() {
+	[ -e "$G/UDC" ] && echo "" > "$G/UDC"
+}
