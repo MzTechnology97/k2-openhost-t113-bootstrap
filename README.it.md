@@ -100,7 +100,11 @@ host esterno (helper.sh)                               T113 della stampante, slo
    ./helper.sh
    ```
 
-   scegli **23) Install the T113 bootstrap** (oppure `./helper.sh t113 install`).
+   Scegli prima **23) Check the printer** (`./helper.sh t113 check`). È in sola lettura e mostra se la stampante è pronta e quale versione Creality userebbe lo slot B:
+
+   <img src="https://raw.githubusercontent.com/MzTechnology97/k2-openhost-installer-helper/main/docs/images/cli-t113-check.png" alt="Controllo del T113" width="720">
+
+   Poi scegli **24) Install the T113 bootstrap** (oppure `./helper.sh t113 install`).
 3. **Conferma** l'avviso, poi inserisci:
    - l'**IP della stampante**;
    - l'**IP dell'host** come lo vede la stampante. L'helper propone l'indirizzo dell'interfaccia che raggiunge la stampante: premi Invio per accettarlo.
@@ -128,10 +132,10 @@ host esterno (helper.sh)                               T113 della stampante, slo
 
 | Azione | Menu | Comando | Cosa fa |
 | --- | --- | --- | --- |
-| Avvio di prova | 25 | `./helper.sh t113 boot-b` | Imposta lo slot B per il prossimo avvio come prova e riavvia la stampante. |
-| Tenere lo slot B | 26 | `./helper.sh t113 commit` | Da lanciare quando lo slot B funziona: diventa quello predefinito. |
-| Tornare allo slot A | 27 | `./helper.sh t113 boot-a` | Slot A al prossimo avvio, poi riavvio. |
-| Stato | 24 | `./helper.sh t113 status` | Slot attivo, prossimo avvio, prova, setup, HelixScreen. |
+| Avvio di prova | 26 | `./helper.sh t113 boot-b` | Imposta lo slot B per il prossimo avvio come prova e riavvia la stampante. |
+| Tenere lo slot B | 27 | `./helper.sh t113 commit` | Da lanciare quando lo slot B funziona: diventa quello predefinito. |
+| Tornare allo slot A | 28 | `./helper.sh t113 boot-a` | Slot A al prossimo avvio, poi riavvio. |
+| Stato | 25 | `./helper.sh t113 status` | Slot attivo, prossimo avvio, prova, setup, HelixScreen. |
 
 **Come ti protegge l'avvio di prova:** all'inizio dell'avvio dello slot B, prima di qualsiasi servizio, l'ambiente di avvio viene già riportato sullo slot A. Se lo slot B si blocca, va in errore o non riesci a raggiungerlo, **spegni e riaccendi la stampante e torna allo slot A**. Solo `commit`, eseguito su uno slot B funzionante, lo rende predefinito.
 
@@ -142,7 +146,7 @@ Dopo l'avvio di prova:
 1. Collega il cavo Micro-USB di servizio all'host, se non lo è già.
 2. Controlla che Klipper sull'host si colleghi (Mainsail mostra la stampante pronta). L'host aspetta fino a 60 s i tre canali gadget.
 3. Controlla lo schermo: al primo avvio viene installato HelixScreen (circa un minuto), già puntato sul tuo host.
-4. Esegui **26) Keep slot B**.
+4. Esegui **27) Keep slot B**.
 
 ## Cosa gira nello slot B
 
@@ -152,7 +156,7 @@ Dopo l'avvio di prova:
 | `k2oh-bridge` | Un processo bridge per bus, riavviato da procd: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motori, 230400 8N1. È il bridge validato sulla stampante di riferimento. |
 | `mcu_update` (originale) | Resta: a ogni avvio avvia le applicazioni di Main e Nozzle MCU (si accendono nel loader Creality), e riscrive ogni scheda la cui versione è diversa dai file firmware dello slot B. |
 | `k2oh-wifi` | Avvia `wpa_supplicant` e `udhcpc` come faceva il `wifi-server` Creality, con le reti copiate dallo slot A. L'Ethernet funziona come nell'originale. |
-| `k2oh-firstboot` / `k2oh-setup` | Primo avvio: installa HelixScreen dall'archivio preparato e lo collega a `HOST_IP:7125`. Riprova a ogni avvio finché non riesce. `k2oh-setup --host <IP>` cambia l'host in seguito (menu 28). |
+| `k2oh-firstboot` / `k2oh-setup` | Primo avvio: installa HelixScreen dall'archivio preparato e lo collega a `HOST_IP:7125`. Riprova a ogni avvio finché non riesce. `k2oh-setup --host <IP>` cambia l'host in seguito (menu 29). |
 | HelixScreen | L'interfaccia touch sullo schermo della stampante, collegata al Moonraker dell'host. |
 | Disattivati | Klipper, klipper_mcu, Moonraker e nginx Creality, app di interfaccia e cloud (`app`), ADB (prenderebbe il controller USB), telecamera WebRTC, OTA da chiavetta (un OTA dallo slot B sovrascriverebbe lo slot A), ripristino di fabbrica `wipe_data` (cancella quasi tutto UDISK). |
 | `chamber_cam_power.sh` | Non fa nulla: sulla K2 Pro il suo `restart` riporta la USB0 in modalità host e fa cadere tutti e tre i canali. |
@@ -166,13 +170,15 @@ Gli aggiornamenti del firmware sono **manuali, apposta**. Si eseguono dallo slot
 
 ### La via breve: ultima versione
 
-Dall'host: voce **30) Update MCU firmware** (`./helper.sh t113 mcu-fw update`), oppure sulla stampante:
+Dall'host: voce **31) Update MCU firmware** (`./helper.sh t113 mcu-fw update`), oppure sulla stampante:
 
 ```sh
 k2oh-mcu-fw update          # aggiungi --cfs per includere le unità CFS
 ```
 
 Cerca l'**ultima** versione nell'indice Creality, la scarica (tiene solo i file firmware), la prepara nello slot B, mostra quali schede cambierebbero e chiede **"Flash the boards now?"**. Se rispondi no non viene scritto nulla adesso: i file preparati vengono scritti al prossimo avvio dello slot B, oppure con `k2oh-mcu-fw apply`, oppure scartati con `k2oh-mcu-fw unstage`. Se rispondi sì esegue `apply` con tutti i suoi controlli (prima ferma Klipper sull'host).
+
+<img src="https://raw.githubusercontent.com/MzTechnology97/k2-openhost-installer-helper/main/docs/images/cli-t113-mcu-fw-update.png" alt="k2oh-mcu-fw update" width="720">
 
 ### Cosa si aggiorna
 
@@ -285,14 +291,14 @@ Cosa manca agli strumenti Creality: sono binari chiusi, registrano meno informaz
 | La stampante non torna dopo l'avvio di prova | Spegni e riaccendi: torna allo slot A. Dallo slot A guarda `/mnt/UDISK/.k2openhost/setup.log`. |
 | Klipper sull'host non si collega | `./helper.sh doctor` controlla i tre canali. Sulla stampante: `logread \| grep -E "k2oh\|bridge"`, `cat /sys/kernel/config/usb_gadget/g1/UDC`. |
 | Lo schermo resta sul logo di avvio | `k2oh-setup status`, `cat /mnt/UDISK/.k2openhost/setup.log`; rilancia `k2oh-setup`. |
-| HelixScreen non raggiunge Moonraker | IP dell'host sbagliato: menu 28 o `k2oh-setup --host <IP>`. Verifica che la stampante raggiunga l'host sulla porta 7125. |
+| HelixScreen non raggiunge Moonraker | IP dell'host sbagliato: menu 29 o `k2oh-setup --host <IP>`. Verifica che la stampante raggiunga l'host sulla porta 7125. |
 | Nessuna rete nello slot B via Wi-Fi | Lo slot A non aveva reti salvate, o sono state aggiunte dopo: imposta il Wi-Fi da HelixScreen, oppure copia `/etc/wifi/wpa_supplicant/wpa_supplicant.conf`. |
 | `apply` si rifiuta di partire | Ferma Klipper sull'host (`sudo systemctl stop klipper`). |
 | Un aggiornamento si è interrotto a metà | Rilancia `k2oh-mcu-fw apply`: lo strumento Creality ricomincia ogni trasferimento dall'inizio. Leggi `/tmp/mcu_update.log`. |
 
 ## Rimozione
 
-1. `./helper.sh t113 boot-a` (menu 27): la stampante torna allo slot A come prima.
+1. `./helper.sh t113 boot-a` (menu 28): la stampante torna allo slot A come prima.
 2. Facoltativo, dallo slot A: `rm -rf /mnt/UDISK/.k2openhost` cancella livello scrivibile, backup e firmware scaricati dello slot B. Le partizioni dello slot B restano com'erano finché un OTA Creality non le riscrive.
 
 ## Riferimento
