@@ -144,11 +144,17 @@ done
 if [ -f "$HERE/helixscreen-install.sh" ]; then
 	cp "$HERE/helixscreen-install.sh" "$K2OH_DIR/setup/" && helix_installer="$K2OH_DIR/setup/helixscreen-install.sh"
 fi
+# Shared secret for k2oh-ctl; the installer helper copies it to the host.
+if [ ! -s "$K2OH_DIR/ctl.token" ]; then
+	python3 -c 'import secrets; print(secrets.token_urlsafe(24))' > "$K2OH_DIR/ctl.token"
+fi
+chmod 0600 "$K2OH_DIR/ctl.token"
 cat > "$K2OH_DIR/k2openhost.conf" <<EOF
 # K2-OpenHost slot B configuration (install-slot-b.sh, k2oh-setup)
 HOST_IP=$HOST_IP
 MOONRAKER_PORT=7125
 MOONRAKER_URL=http://$HOST_IP:7125
+CTL_PORT=7130
 HELIX_ARCHIVE=$helix_archive
 HELIX_INSTALLER=$helix_installer
 EOF

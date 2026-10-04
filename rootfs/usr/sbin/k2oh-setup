@@ -129,6 +129,25 @@ def point_helix(host, port):
     return changed
 
 
+TOKEN = os.path.join(K2OH_DIR, "ctl.token")
+
+
+def ensure_token():
+    """k2oh-ctl's shared secret (normally written by install-slot-b.sh)."""
+    try:
+        with open(TOKEN) as f:
+            if len(f.read().strip()) >= 16:
+                return False
+    except OSError:
+        pass
+    import secrets
+    fd = os.open(TOKEN, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(secrets.token_urlsafe(24) + "\n")
+    log("created %s for k2oh-ctl; copy it to the external host" % TOKEN)
+    return True
+
+
 def apply(conf):
     host = conf.get("HOST_IP", "")
     port = conf.get("MOONRAKER_PORT", "7125")
@@ -139,6 +158,10 @@ def apply(conf):
         conf["MOONRAKER_URL"] = "http://%s:%s" % (host, port)
         write_conf(conf)
     log("external host: %s (Moonraker %s)" % (host, conf["MOONRAKER_URL"]))
+    ensure_token()
+    if os.path.exists("/etc/init.d/k2oh-ctl"):
+        # k2oh-ctl reads HOST_IP and the token at start.
+        subprocess.run(["/etc/init.d/k2oh-ctl", "restart"], stdin=subprocess.DEVNULL)
     helix_ok = install_helix(conf)
     point_helix(host, port)
     if not helix_ok:

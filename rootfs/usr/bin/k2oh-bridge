@@ -8,8 +8,14 @@ traffic (seen on RS-485 during the Cartographer multiplexing test). This is
 the bridge validated on the K2 Pro (Main, Nozzle and RS-485 at 230400 8N1),
 with an idle wait on empty reads and a non-zero exit on I/O errors so procd
 restarts it.
+
+Each bridge also writes its counters to /tmp/k2oh-bridge/<ttyGSx>.json at
+most once a second (bytes each way, last data seen from the host and from
+the UART, in CLOCK_MONOTONIC seconds). k2oh-ctl reads them for telemetry;
+nothing on the data path waits for that file.
 """
 
+import json
 import os
 import select
 import signal
@@ -18,7 +24,43 @@ import termios
 import time
 
 BAUD = termios.B230400
+STATS_DIR = os.environ.get("K2OH_BRIDGE_STATS", "/tmp/k2oh-bridge")
 running = True
+
+
+class Stats:
+    def __init__(self, usb_path, uart_path):
+        self.path = os.path.join(STATS_DIR, os.path.basename(usb_path) + ".json")
+        self.data = {
+            "usb": usb_path, "uart": uart_path, "pid": os.getpid(),
+            "started": time.monotonic(), "host_bytes": 0, "uart_bytes": 0,
+            "last_host_rx": None, "last_uart_rx": None, "updated": None,
+        }
+        self._next = 0.0
+
+    def note(self, from_host, count):
+        now = time.monotonic()
+        if from_host:
+            self.data["host_bytes"] += count
+            self.data["last_host_rx"] = now
+        else:
+            self.data["uart_bytes"] += count
+            self.data["last_uart_rx"] = now
+
+    def flush(self, force=False):
+        now = time.monotonic()
+        if not force and now < self._next:
+            return
+        self._next = now + 1.0
+        self.data["updated"] = now
+        try:
+            os.makedirs(STATS_DIR, exist_ok=True)
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.data, f)
+            os.rename(tmp, self.path)
+        except OSError:
+            pass  # telemetry only; never stop the bridge for it
 
 
 def stop_handler(signum, frame):
@@ -69,10 +111,13 @@ def main():
     termios.tcflush(usb, termios.TCIOFLUSH)
     termios.tcflush(uart, termios.TCIOFLUSH)
     print("bridge active: %s <-> %s @ 230400" % (usb_path, uart_path), flush=True)
+    stats = Stats(usb_path, uart_path)
+    stats.flush(force=True)
 
     try:
         while running:
             readable, _, _ = select.select([usb, uart], [], [], 1)
+            stats.flush()
             for src in readable:
                 try:
                     data = os.read(src, 4096)
@@ -83,11 +128,13 @@ def main():
                     # port closed; wait instead of spinning.
                     time.sleep(0.05)
                     continue
+                stats.note(src == usb, len(data))
                 write_all(uart if src == usb else usb, data)
     except OSError as exc:
         print("bridge error on %s <-> %s: %s" % (usb_path, uart_path, exc), file=sys.stderr, flush=True)
         return 1
     finally:
+        stats.flush(force=True)
         os.close(uart)
         os.close(usb)
     print("bridge stopped: %s <-> %s" % (usb_path, uart_path), flush=True)

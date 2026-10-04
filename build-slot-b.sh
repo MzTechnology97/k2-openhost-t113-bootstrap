@@ -125,6 +125,8 @@ ln -sf ../init.d/k2oh-gadget "$root/etc/rc.d/S55k2oh-gadget"
 ln -sf ../init.d/k2oh-gadget "$root/etc/rc.d/K11k2oh-gadget"
 ln -sf ../init.d/k2oh-bridge "$root/etc/rc.d/S56k2oh-bridge"
 ln -sf ../init.d/k2oh-bridge "$root/etc/rc.d/K10k2oh-bridge"
+ln -sf ../init.d/k2oh-ctl "$root/etc/rc.d/S57k2oh-ctl"
+ln -sf ../init.d/k2oh-ctl "$root/etc/rc.d/K09k2oh-ctl"
 ln -sf ../init.d/k2oh-firstboot "$root/etc/rc.d/S99k2oh-firstboot"
 # rootfs_data belongs to slot A: do not let block-mount attach it to /overlay.
 # block-mount must not run e2fsck on UDISK either.
