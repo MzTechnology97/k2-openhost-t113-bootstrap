@@ -182,8 +182,15 @@ def test_power_on_needs_no_host(gpio):
 
 def test_estop_needs_nothing(gpio):
     ctl, runner, _l, root = controller(gpio, Host(fail=True))
-    assert ctl.estop() == {"state": "off"}
+    assert ctl.estop() == {"state": "off", "cycled": False}
     assert value(root, 140) == "1" and runner.cmds == []
+
+
+def test_estop_cycle_restores_power(gpio):
+    ctl, runner, log, root = controller(gpio, Host(fail=True))
+    assert ctl.estop(cycle=True) == {"state": "on", "cycled": True}
+    assert log == [("sleep", 2.0, "1")]
+    assert value(root, 140) == "0" and runner.cmds == []
 
 
 def test_never_changes_direction(gpio):
@@ -205,7 +212,7 @@ def test_beep_is_bounded_and_ends_off(gpio):
     states = []
     ctl.sleep = lambda s: states.append((s, value(root, 164)))
     result = ctl.beep(ms=99999, count=50)
-    assert result == {"queued": True, "ms": 3000, "count": 5}
+    assert result == {"queued": True, "pattern": [3000, 120] * 4 + [3000]}
     for _ in range(100):
         if ctl.beep_lock.acquire(False):
             ctl.beep_lock.release()
@@ -315,3 +322,38 @@ def test_http_bad_requests(server):
     assert call(base, "/nothing", {})[0] == 404
     code, body = call(base, "/status")
     assert code == 200 and body["mcu_power"] == "on"
+
+
+def wait_beep(ctl):
+    for _ in range(200):
+        if ctl.beep_lock.acquire(False):
+            ctl.beep_lock.release()
+            return
+        threading.Event().wait(0.01)
+
+
+def test_beep_pattern_alternates_sound_and_silence(gpio):
+    ctl, _r, _l, root = controller(gpio)
+    states = []
+    ctl.sleep = lambda s: states.append((s, value(root, 164)))
+    result = ctl.beep(pattern=[150, 100, 150, 100, 600])
+    assert result == {"queued": True, "pattern": [150, 100, 150, 100, 600]}
+    wait_beep(ctl)
+    assert states == [(0.15, "1"), (0.1, "0"), (0.15, "1"), (0.1, "0"), (0.6, "1")]
+    assert value(root, 164) == "0"
+
+
+@pytest.mark.parametrize("pattern", [[], [10], "200", [200] * 17, [3000, 0] * 4, [True]])
+def test_bad_patterns(gpio, pattern):
+    ctl, _r, _l, _root = controller(gpio)
+    with pytest.raises(ValueError):
+        ctl.beep(pattern=pattern)
+
+
+def test_http_beep_pattern_and_estop_cycle(server):
+    base, _ctl, _runner, root = server
+    code, body = call(base, "/beep", {"pattern": [200, 100, 200]})
+    assert code == 200 and body["pattern"] == [200, 100, 200]
+    assert call(base, "/beep", {"pattern": "x"})[0] == 400
+    code, body = call(base, "/estop", {"cycle": True})
+    assert code == 200 and body == {"state": "on", "cycled": True}

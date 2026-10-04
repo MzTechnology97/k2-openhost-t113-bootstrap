@@ -10,10 +10,11 @@ k2openhost.conf) and only requests carrying the shared token
     GET  /status          telemetry (read only)
     POST /power/mcu       {"command": "status"|"on"|"off"} -> {"state": ...}
     POST /mcu/cycle       power-cycle the MCU rail (bridges stopped around it)
-    POST /beep            {"ms": 200, "count": 1}
+    POST /beep            {"ms": 200, "count": 1} or {"pattern": [on, off, on]}
     POST /bridges/restart restart the three USB bridges
     POST /screen/restart  restart HelixScreen
-    POST /estop           cut the MCU rail now, no checks (hardware e-stop)
+    POST /estop           cut the MCU rail now, no checks (hardware e-stop);
+                          {"cycle": true} restores it after 2 s (MCU reset)
 
 /power/mcu matches Moonraker's generic "http" power device. Everything that
 interrupts the printer (off, cycle, bridge restart) first asks the host's
@@ -57,6 +58,8 @@ BRIDGES = (("main", "ttyGS0", "ttyS2"), ("nozzle", "ttyGS1", "ttyS3"),
 HELIX_INITS = ("/etc/init.d/S99helixscreen", "/etc/init.d/helixscreen")
 MAX_BEEP_MS = 3000
 MAX_BEEP_COUNT = 5
+MAX_PATTERN_STEPS = 16
+MAX_PATTERN_MS = 10000
 
 
 def read(path, default=None):
@@ -213,27 +216,43 @@ class Controller:
             return {"state": self.mcu_power_state(), "detail": detail,
                     "next": "FIRMWARE_RESTART on the external host"}
 
-    def estop(self):
+    def estop(self, cycle=False):
         # No host check: this is the hardware stop. Bridges are left alone so
-        # the host sees the MCUs disappear and shuts down too.
+        # the host sees the MCUs disappear and shuts down too. With cycle the
+        # rail comes back after CYCLE_OFF_SECONDS: the MCUs restart from reset
+        # with every output off, ready for FIRMWARE_RESTART.
         self.gpio.set(MCU_POWER_GPIO, 1)
-        self._note("estop", "MCU rail off")
-        return {"state": self.mcu_power_state()}
+        if cycle:
+            try:
+                self.sleep(CYCLE_OFF_SECONDS)
+            finally:
+                self.gpio.set(MCU_POWER_GPIO, 0)
+        self._note("estop", "MCU rail power-cycled" if cycle else "MCU rail off")
+        return {"state": self.mcu_power_state(), "cycled": bool(cycle)}
 
-    def beep(self, ms=200, count=1, gap_ms=120):
-        ms = max(20, min(int(ms), MAX_BEEP_MS))
-        count = max(1, min(int(count), MAX_BEEP_COUNT))
+    def beep(self, ms=200, count=1, gap_ms=120, pattern=None):
+        if pattern is not None:
+            steps = clean_pattern(pattern)
+        else:
+            ms = max(20, min(int(ms), MAX_BEEP_MS))
+            count = max(1, min(int(count), MAX_BEEP_COUNT))
+            steps = []
+            for _ in range(count):
+                steps += [ms, gap_ms]
+            steps = steps[:-1]
         if not self.beep_lock.acquire(False):
             return {"queued": False, "detail": "already beeping"}
 
         def worker():
             try:
-                for n in range(count):
-                    self.gpio.set(BUZZER_GPIO, 1)
-                    self.sleep(ms / 1000.0)
-                    self.gpio.set(BUZZER_GPIO, 0)
-                    if n + 1 < count:
-                        self.sleep(gap_ms / 1000.0)
+                # Even steps sound, odd steps are silence, like stock beep.sh.
+                for n, step in enumerate(steps):
+                    if n % 2 == 0:
+                        self.gpio.set(BUZZER_GPIO, 1)
+                        self.sleep(step / 1000.0)
+                        self.gpio.set(BUZZER_GPIO, 0)
+                    else:
+                        self.sleep(step / 1000.0)
             except Exception:
                 pass
             finally:
@@ -244,7 +263,7 @@ class Controller:
                 self.beep_lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
-        return {"queued": True, "ms": ms, "count": count}
+        return {"queued": True, "pattern": steps}
 
     def bridges_restart(self, force=False):
         with self.lock:
@@ -285,6 +304,24 @@ class Controller:
             "last_action": self.last_action,
             "now": now,
         }
+
+
+def clean_pattern(pattern):
+    """Validate on,off,on,... (ms): bounded steps and total length."""
+    if not isinstance(pattern, list) or not pattern:
+        raise ValueError("pattern must be a non-empty list of milliseconds")
+    if len(pattern) > MAX_PATTERN_STEPS:
+        raise ValueError("pattern: at most %d steps" % MAX_PATTERN_STEPS)
+    steps = []
+    for step in pattern:
+        if isinstance(step, bool) or not isinstance(step, (int, float)):
+            raise ValueError("pattern steps must be numbers")
+        steps.append(max(0, min(int(step), MAX_BEEP_MS)))
+    if steps[0] < 20:
+        raise ValueError("pattern: the first beep must be >= 20 ms")
+    if sum(steps) > MAX_PATTERN_MS:
+        raise ValueError("pattern: at most %d ms in total" % MAX_PATTERN_MS)
+    return steps
 
 
 def _float(text):
@@ -442,13 +479,14 @@ def make_handler(ctl, token, allowed):
                 elif path == "/mcu/cycle":
                     result = ctl.mcu_cycle(force)
                 elif path == "/beep":
-                    result = ctl.beep(body.get("ms", 200), body.get("count", 1))
+                    result = ctl.beep(body.get("ms", 200), body.get("count", 1),
+                                      pattern=body.get("pattern"))
                 elif path == "/bridges/restart":
                     result = ctl.bridges_restart(force)
                 elif path == "/screen/restart":
                     result = ctl.screen_restart()
                 elif path == "/estop":
-                    result = ctl.estop()
+                    result = ctl.estop(cycle=body.get("cycle") is True)
                 else:
                     return self._reply(404, {"error": "unknown path"})
             except PermissionError as exc:
