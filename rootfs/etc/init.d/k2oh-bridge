@@ -10,14 +10,23 @@ USE_PROCD=1
 
 bridge() {
 	procd_open_instance "$1"
-	procd_set_param command /usr/bin/python3 /usr/bin/k2oh-bridge "$2" "$3"
-	procd_set_param respawn 3600 2 0
+	# shellcheck disable=SC2086 # BRIDGE_OPTS is a list of options
+	procd_set_param command /usr/bin/python3 /usr/bin/k2oh-bridge $BRIDGE_OPTS "$2" "$3"
+	# Restart 1 s after a crash: Klipper tolerates about 5 s without its MCU,
+	# so a crashed bridge comes back before the host gives up. A process that
+	# keeps dying faster than 60 s is still retried, never faster than 1/s.
+	procd_set_param respawn 60 1 0
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_close_instance
 }
 
 start_service() {
+	# No tuning by default: in the USB bridge benchmarks (see README) nice,
+	# SCHED_RR and IRQ affinity stayed within the spread of identical runs.
+	# Set BRIDGE_OPTS="..." in k2openhost.conf to try them (e.g. "--rr 10").
+	BRIDGE_OPTS=""
+	[ -f /mnt/UDISK/.k2openhost/k2openhost.conf ] && . /mnt/UDISK/.k2openhost/k2openhost.conf 2>/dev/null
 	local n
 	for n in 1 2 3 4 5 6 7 8 9 10; do
 		[ -c /dev/ttyGS2 ] && break
