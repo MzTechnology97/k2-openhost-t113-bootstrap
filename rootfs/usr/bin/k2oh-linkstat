@@ -1,0 +1,207 @@
+#!/usr/bin/python3
+"""Low-cost T113 link sampler for long prints.
+
+    k2oh-linkstat [--interval 10] [--out /tmp/k2oh-linkstat.csv]
+
+Every interval it appends one CSV row with what the T113 really exposes:
+- CPU use per core and context switches (/proc/stat);
+- interrupt counts of the USB device controller and the K2 UARTs
+  (/proc/interrupts), and the NET_RX/TASKLET softirqs (/proc/softirqs);
+- UART counters per port (/proc/tty/driver/*): rx, tx, framing errors (fe),
+  overruns (oe), buffer overruns (bo), breaks (brk) - as deltas;
+- the USB device controller state (/sys/class/udc/*/state);
+- per bridge (pid from the bridge stats file or the process list): CPU %,
+  voluntary/involuntary context switches, RSS, and the bridge's own
+  counters (bytes, short writes, EAGAIN, dropped, times queued, max queue,
+  max queue delay);
+- MemAvailable.
+Reading these files is the only work; nothing touches the data path.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import time
+
+UART_PORTS = {"2": "main", "3": "nozzle", "5": "rs485"}
+BRIDGES = (("main", "ttyGS0"), ("nozzle", "ttyGS1"), ("rs485", "ttyGS2"))
+STATS_DIR = os.environ.get("K2OH_BRIDGE_STATS", "/tmp/k2oh-bridge")
+TICK = os.sysconf("SC_CLK_TCK")
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def cpu_times():
+    cores = {}
+    ctxt = 0
+    for line in read("/proc/stat").splitlines():
+        parts = line.split()
+        if parts and re.match(r"^cpu\d+$", parts[0]):
+            values = [int(v) for v in parts[1:8]]
+            idle = values[3] + values[4]
+            cores[parts[0]] = (sum(values), idle)
+        elif parts and parts[0] == "ctxt":
+            ctxt = int(parts[1])
+    return cores, ctxt
+
+
+def irq_counts():
+    counts = {}
+    for line in read("/proc/interrupts").splitlines()[1:]:
+        parts = line.split()
+        if not parts or not parts[0].rstrip(":").isdigit():
+            continue
+        name = parts[-1]
+        if name in ("sunxi_usb_udc", "uart2", "uart3", "uart5"):
+            numbers = [int(p) for p in parts[1:] if p.isdigit()]
+            counts[name] = numbers
+    return counts
+
+
+def softirqs():
+    result = {}
+    for line in read("/proc/softirqs").splitlines():
+        parts = line.split()
+        if parts and parts[0] in ("NET_RX:", "TASKLET:", "TIMER:"):
+            result[parts[0].rstrip(":")] = sum(int(p) for p in parts[1:])
+    return result
+
+
+def uart_counters():
+    result = {}
+    for path in glob.glob("/proc/tty/driver/*"):
+        for line in read(path).splitlines():
+            match = re.match(r"^(\d+): uart:", line)
+            if not match or match.group(1) not in UART_PORTS:
+                continue
+            fields = dict(re.findall(r"(\w+):(\d+)", line))
+            result[UART_PORTS[match.group(1)]] = {
+                k: int(fields.get(k, 0)) for k in ("rx", "tx", "fe", "oe", "bo", "brk")
+            }
+    return result
+
+
+def bridge_pid(gs):
+    data = {}
+    try:
+        with open(os.path.join(STATS_DIR, gs + ".json")) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        pass
+    pid = data.get("pid")
+    if pid and os.path.exists("/proc/%d" % pid):
+        return pid, data
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            cmd = read("/proc/%s/cmdline" % entry).replace("\0", " ")
+            if ("/dev/%s " % gs) in cmd + " " and "python" in cmd:
+                return int(entry), data
+    return None, data
+
+
+def proc_stats(pid):
+    try:
+        fields = read("/proc/%d/stat" % pid).rsplit(")", 1)[1].split()
+        cpu = (int(fields[11]) + int(fields[12])) / float(TICK)
+    except (IndexError, ValueError):
+        return None
+    vol = invol = rss = 0
+    for line in read("/proc/%d/status" % pid).splitlines():
+        if line.startswith("voluntary_ctxt_switches:"):
+            vol = int(line.split()[1])
+        elif line.startswith("nonvoluntary_ctxt_switches:"):
+            invol = int(line.split()[1])
+        elif line.startswith("VmRSS:"):
+            rss = int(line.split()[1])
+    return cpu, vol, invol, rss
+
+
+def mem_available():
+    for line in read("/proc/meminfo").splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1])
+    return ""
+
+
+def snapshot():
+    snap = {"t": time.monotonic(), "cpu": cpu_times(), "irq": irq_counts(),
+            "soft": softirqs(), "uart": uart_counters(), "bridges": {}}
+    for name, gs in BRIDGES:
+        pid, data = bridge_pid(gs)
+        snap["bridges"][name] = (pid, proc_stats(pid) if pid else None, data)
+    return snap
+
+
+HEADER = None
+
+
+def row(prev, cur):
+    dt = max(1e-6, cur["t"] - prev["t"])
+    out = [("time", time.strftime("%Y-%m-%dT%H:%M:%S"))]
+    (pcores, pctxt), (ccores, cctxt) = prev["cpu"], cur["cpu"]
+    for core in sorted(ccores):
+        total = ccores[core][0] - pcores.get(core, (0, 0))[0]
+        idle = ccores[core][1] - pcores.get(core, (0, 0))[1]
+        out.append((core + "_pct", "%.1f" % (100.0 * (total - idle) / total) if total else ""))
+    out.append(("ctxt_per_s", "%.0f" % ((cctxt - pctxt) / dt)))
+    for name in ("sunxi_usb_udc", "uart2", "uart3", "uart5"):
+        c, p = cur["irq"].get(name), prev["irq"].get(name)
+        out.append((name + "_irq_per_s",
+                    "%.0f" % ((sum(c) - sum(p)) / dt) if c and p else ""))
+        out.append((name + "_cpus", "/".join(str(v) for v in c) if c else ""))
+    for name in ("NET_RX", "TASKLET", "TIMER"):
+        c, p = cur["soft"].get(name), prev["soft"].get(name)
+        out.append((name.lower() + "_per_s", "%.0f" % ((c - p) / dt) if c is not None and p is not None else ""))
+    for port in ("main", "nozzle", "rs485"):
+        c, p = cur["uart"].get(port, {}), prev["uart"].get(port, {})
+        for key in ("rx", "tx", "fe", "oe", "bo", "brk"):
+            out.append(("uart_%s_%s" % (port, key),
+                        c.get(key, 0) - p.get(key, 0) if c and p else ""))
+    out.append(("udc_state", " ".join(read(s).strip() for s in glob.glob("/sys/class/udc/*/state"))))
+    for name, _gs in BRIDGES:
+        pid, ps, data = cur["bridges"][name]
+        ppid, pps, _ = prev["bridges"][name]
+        same = pid and pid == ppid and ps and pps
+        out.append(("%s_pid" % name, pid or ""))
+        out.append(("%s_cpu_pct" % name, "%.2f" % (100.0 * (ps[0] - pps[0]) / dt) if same else ""))
+        out.append(("%s_ctx_vol" % name, ps[1] - pps[1] if same else ""))
+        out.append(("%s_ctx_invol" % name, ps[2] - pps[2] if same else ""))
+        out.append(("%s_rss_kb" % name, ps[3] if ps else ""))
+        for d in ("to_uart", "to_host"):
+            s = data.get(d) or {}
+            for key in ("bytes", "short_writes", "eagain", "dropped", "queued",
+                        "max_pending", "max_delay_us"):
+                out.append(("%s_%s_%s" % (name, d, key), s.get(key, "")))
+    out.append(("mem_available_kb", mem_available()))
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="k2oh-linkstat")
+    parser.add_argument("--interval", type=float, default=10.0)
+    parser.add_argument("--out", default="/tmp/k2oh-linkstat.csv")
+    args = parser.parse_args()
+    prev = snapshot()
+    header_written = os.path.exists(args.out) and os.path.getsize(args.out) > 0
+    with open(args.out, "a", buffering=1) as f:
+        while True:
+            time.sleep(args.interval)
+            cur = snapshot()
+            fields = row(prev, cur)
+            if not header_written:
+                f.write(",".join(k for k, _ in fields) + "\n")
+                header_written = True
+            f.write(",".join(str(v) for _, v in fields) + "\n")
+            prev = cur
+
+
+if __name__ == "__main__":
+    main()
