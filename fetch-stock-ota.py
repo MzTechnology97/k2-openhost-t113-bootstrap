@@ -12,7 +12,6 @@ prints the releases in the index, oldest first.
 """
 
 import argparse
-import hashlib
 import importlib.machinery
 import importlib.util
 import os
