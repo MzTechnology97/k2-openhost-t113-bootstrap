@@ -145,7 +145,8 @@ After the trial boot:
 | Part | Detail |
 | --- | --- |
 | `k2oh-gadget` | Puts USB0 in device mode and creates three Generic Serial functions (`0525:a4a6`, interfaces 00/01/02), as the host udev rules expect. |
-| `k2oh-bridge` | One bridge process per bus, restarted by procd: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motors, 230400 8N1. It is the bridge validated on the reference printer. |
+| `k2oh-bridge` | One bridge process per bus: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motors, 230400 8N1. Each direction has its own non-blocking queue, so a stalled side never stops the other. It waits for missing ports instead of exiting, and reopens the gadget port after a USB reconnect (the old descriptor only returns EOF). After a crash procd restarts it in 1 s, before Klipper gives up on its MCU (about 5 s). Counters go to `/tmp/k2oh-bridge/`. Options in `k2openhost.conf` as `BRIDGE_OPTS="..."` (`--chunk`, `--nice`, `--rr`, `--cpu`); the default is none, chosen from the [benchmarks](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/en/USB_BRIDGE.md). |
+| `k2oh-linkstat` | Optional sampler for long prints: CPU, interrupts, UART error deltas, gadget state and bridge counters every 10 s to a CSV in RAM. Start it by hand: `k2oh-linkstat --out /tmp/k2oh-linkstat.csv &`. |
 | `mcu_update` (stock) | Kept: at every boot it starts the Main and Nozzle MCU applications (they power up in Creality's loader). It also reflashes any board whose version differs from slot B's firmware files. |
 | `k2oh-ctl` | Control service for the external host: telemetry, MCU power rail, buzzer, bridges, HelixScreen. See [Control service](#control-service-k2oh-ctl). |
 | `k2oh-wifi` | Starts `wpa_supplicant` and `udhcpc` like Creality's `wifi-server` did, with the networks copied from slot A. Ethernet works as in stock. |
@@ -412,7 +413,8 @@ python3 fetch-stock-ota.py 1.1.0.94 stock         # or "latest"
 | Stock OTA download from Creality's CDN | 1.1.0.94 kernel/rootfs MD5 identical to the validated base |
 | Newer release 1.1.7.0 | boot scripts slot B changes identical to 1.1.0.94, same services, kernel 5.4.61 with gadget serial and OTG manager; slot B builds with the "not tested" warning. Not booted. |
 | Scripts with the printer's own BusyBox and Python 3.9 (chroot) | syntax checks pass |
-| Bridge with pseudo-terminals | 10 KB binary both ways, 0 CPU idle, clean stop |
+| Bridge with pseudo-terminals | 10 KB binary both ways, no CR/LF changes, a stalled side does not block the other, clean stop |
+| Bridge on the reference printer, from RAM in slot A (benchmarks in [USB_BRIDGE](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/en/USB_BRIDGE.md)) | 10-minute windows with XY motion, the extruder turning cold and RFID reads: same round trips as the original bridge within the spread between identical runs, 1.0–1.2% CPU on Main, 0 UART errors, 0 queued or dropped bytes |
 | `k2oh-mcu-fw` extraction vs `unsquashfs` | 15 firmware files byte-identical |
 | `k2oh-mcu-fw list/download/stage/unstage/status` | 1.1.7.0 downloaded from Creality, staged and restored |
 | `apply` safety check | refused while the host Klipper was ready |

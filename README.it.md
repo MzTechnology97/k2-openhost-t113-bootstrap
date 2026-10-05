@@ -154,7 +154,8 @@ Dopo l'avvio di prova:
 | Parte | Dettaglio |
 | --- | --- |
 | `k2oh-gadget` | Mette la USB0 in modalità device e crea tre funzioni Generic Serial (`0525:a4a6`, interfacce 00/01/02), come si aspettano le regole udev dell'host. |
-| `k2oh-bridge` | Un processo bridge per bus, riavviato da procd: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motori, 230400 8N1. È il bridge validato sulla stampante di riferimento. |
+| `k2oh-bridge` | Un processo bridge per bus: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motori, 230400 8N1. Ogni direzione ha la sua coda non bloccante, così un lato fermo non blocca mai l'altro. Attende le porte mancanti invece di uscire, e riapre la porta del gadget dopo una riconnessione USB (il vecchio descrittore restituisce solo EOF). Dopo un crash procd lo riavvia in 1 s, prima che Klipper rinunci alla sua MCU (circa 5 s). I contatori vanno in `/tmp/k2oh-bridge/`. Opzioni in `k2openhost.conf` come `BRIDGE_OPTS="..."` (`--chunk`, `--nice`, `--rr`, `--cpu`); il predefinito è nessuna, scelto in base ai [benchmark](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/it/USB_BRIDGE.md). |
+| `k2oh-linkstat` | Campionatore opzionale per stampe lunghe: CPU, interrupt, differenze degli errori UART, stato del gadget e contatori dei bridge ogni 10 s in un CSV in RAM. Si avvia a mano: `k2oh-linkstat --out /tmp/k2oh-linkstat.csv &`. |
 | `mcu_update` (originale) | Resta: a ogni avvio avvia le applicazioni di Main e Nozzle MCU (si accendono nel loader Creality), e riscrive ogni scheda la cui versione è diversa dai file firmware dello slot B. |
 | `k2oh-ctl` | Servizio di controllo per l'host esterno: telemetria, alimentazione delle MCU, buzzer, bridge, HelixScreen. Vedi [Servizio di controllo](#servizio-di-controllo-k2oh-ctl). |
 | `k2oh-wifi` | Avvia `wpa_supplicant` e `udhcpc` come faceva il `wifi-server` Creality, con le reti copiate dallo slot A. L'Ethernet funziona come nell'originale. |
@@ -404,7 +405,8 @@ python3 fetch-stock-ota.py 1.1.0.94 stock         # oppure "latest"
 | Download dell'OTA originale dal CDN Creality | MD5 di kernel e rootfs 1.1.0.94 identici alla base validata |
 | Versione più recente 1.1.7.0 | script di avvio modificati dallo slot B identici alla 1.1.0.94, stessi servizi, kernel 5.4.61 con gadget seriale e gestore OTG; lo slot B si costruisce con l'avviso "non provata". Non avviato. |
 | Script con BusyBox e Python 3.9 della stampante (chroot) | controlli di sintassi superati |
-| Bridge con pseudo-terminali | 10 KB binari nei due sensi, 0 CPU a riposo, arresto pulito |
+| Bridge con pseudo-terminali | 10 KB binari nei due sensi, nessuna modifica CR/LF, un lato fermo non blocca l'altro, arresto pulito |
+| Bridge sulla stampante di riferimento, da RAM nello slot A (benchmark in [USB_BRIDGE](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/it/USB_BRIDGE.md)) | finestre di 10 minuti con moto XY, estrusore che gira a freddo e letture RFID: stessi round trip del bridge originale entro la variabilità tra corse identiche, CPU 1,0–1,2% sul Main, 0 errori UART, 0 byte accodati o scartati |
 | Estrazione di `k2oh-mcu-fw` rispetto a `unsquashfs` | 15 file firmware identici byte per byte |
 | `k2oh-mcu-fw list/download/stage/unstage/status` | 1.1.7.0 scaricata da Creality, preparata e ripristinata |
 | Protezione di `apply` | rifiutato con il Klipper dell'host attivo |
