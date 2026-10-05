@@ -361,6 +361,7 @@ What Creality's tools lack: they are closed binaries, they log less, and they re
 | --- | --- |
 | The printer does not come back after the trial boot | Power cycle it: it returns to slot A. Look at `/mnt/UDISK/.k2openhost/setup.log` from slot A. |
 | Klipper on the host does not connect | `./helper.sh doctor` checks the three channels. On the printer: `logread \| grep -E "k2oh\|bridge"`, `cat /sys/kernel/config/usb_gadget/g1/UDC`. |
+| `lsusb` shows `0525:a4a6 Linux-USB Serial Gadget` but no `/dev/ttyUSB0..2` exist | The host kernel saw the T113 gadget but did not bind Linux's generic `usbserial` driver. Run `sudo sh ~/k2-openhost-t113-bootstrap/host/k2oh-host-usbserial install`. It persists `vendor=0x0525 product=0xa4a6` in modprobe/modules-load configuration and binds a live gadget without unloading other serial devices. |
 | The screen stays on the boot logo | `k2oh-setup status`, `cat /mnt/UDISK/.k2openhost/setup.log`; run `k2oh-setup` again. |
 | HelixScreen cannot reach Moonraker | Wrong host IP: menu 29 or `k2oh-setup --host <IP>`. Check that the printer reaches the host on port 7125. |
 | No network in slot B over Wi-Fi | Slot A had no saved network, or it was added later: set Wi-Fi from HelixScreen, or copy `/etc/wifi/wpa_supplicant/wpa_supplicant.conf`. |
@@ -382,6 +383,7 @@ What Creality's tools lack: they are closed binaries, they log less, and they re
 | `fetch-stock-ota.py` | host | Lists Creality's releases, downloads one (or the latest), checks MD5, keeps `kernel` and `rootfs`. |
 | `install-slot-b.sh` | printer, slot A | `--check` / write slot B, backups, setup files. |
 | `rootfs/` | — | Files added to the stock root filesystem. |
+| `host/k2oh-host-usbserial` | host | Persists and activates the Linux generic `usbserial` binding required by the T113 `0525:a4a6` three-channel `gser` gadget. |
 | [`scripts/t113.sh`](https://github.com/MzTechnology97/k2-openhost-installer-helper/blob/main/scripts/t113.sh) (installer helper) | host | The helper's T113 commands; clones this repository to `~/k2-openhost-t113-bootstrap`. |
 
 ### Paths on the printer
