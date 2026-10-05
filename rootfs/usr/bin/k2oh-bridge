@@ -1,20 +1,36 @@
 #!/usr/bin/python3
 """Byte-transparent bridge between a USB gadget serial port and a K2 UART.
 
-    k2oh-bridge /dev/ttyGS0 /dev/ttyS2
+    k2oh-bridge [--chunk N] [--nice N] [--rr PRIO] [--cpu LIST] /dev/ttyGS0 /dev/ttyS2
 
 One process per channel: a second owner on the same UART corrupts the
-traffic (seen on RS-485 during the Cartographer multiplexing test). This is
-the bridge validated on the K2 Pro (Main, Nozzle and RS-485 at 230400 8N1),
-with an idle wait on empty reads and a non-zero exit on I/O errors so procd
-restarts it.
+traffic (seen on RS-485 during the Cartographer multiplexing test). Both
+ports are raw 8N1 (no echo, no canonical mode, no CR/LF translation, no
+flow control); the UART runs at 230400.
 
-Each bridge also writes its counters to /tmp/k2oh-bridge/<ttyGSx>.json at
-most once a second (bytes each way, last data seen from the host and from
-the UART, in CLOCK_MONOTONIC seconds). k2oh-ctl reads them for telemetry;
-nothing on the data path waits for that file.
+Each direction has its own non-blocking output queue: a port that cannot
+take data right now (the host not reading while Klipper is stopped, a full
+UART FIFO) never stops the other direction from being read. The original
+loop wrote with a blocking retry, so one stalled side froze both and the
+UART overran. A queue that grows past MAX_PENDING bytes (nobody reading)
+drops its oldest bytes and counts them: Klipper resynchronises on its own
+and the UART keeps draining.
+
+Counters go to /tmp/k2oh-bridge/<ttyGSx>.json every 5 s in a quiet moment
+of the line (every 30 s when nothing changed): bytes and reads per
+direction, short writes, EAGAIN, write errors, dropped bytes, how often data
+had to queue, the highest queue depth, and for queued data the delay until
+the queue emptied (max and a log2 histogram in microseconds). Data written
+straight through is not timed: on the T113 the timing cost more CPU than the
+forwarding itself.
+EINTR is retried inside Python (PEP 475), so it cannot be counted here.
+
+Options exist for benchmarks: --chunk (read size), --nice, --rr (SCHED_RR
+priority, 1-99), --cpu (affinity, e.g. 1 or 0,1).
 """
 
+import argparse
+import errno
 import json
 import os
 import select
@@ -25,42 +41,27 @@ import time
 
 BAUD = termios.B230400
 STATS_DIR = os.environ.get("K2OH_BRIDGE_STATS", "/tmp/k2oh-bridge")
+MAX_PENDING = 65536
+HIST_BUCKETS = 24  # 1 us .. ~8 s in powers of two
+# Writing the stats file costs about 3.5 ms of CPU on the T113. Done right
+# after forwarding a request, it held back the MCU's answer: the 99th
+# percentile round trip went from about 2 to about 4 ms. So the file is
+# written only in a quiet moment (no data for QUIET_MS), every FLUSH_EVERY
+# seconds, and anyway after FLUSH_LATE seconds without a quiet moment.
+FLUSH_EVERY = 5.0
+QUIET_MS = 20
+FLUSH_LATE = 30.0
+# EOF on the gadget port: the host closed it, or the gadget was unbound and
+# bound again. After a rebind the old descriptor stays dead (EOF forever,
+# seen on RS-485, which had no traffic to fail with EIO), so the port is
+# reopened, waiting REOPEN_MIN doubling up to REOPEN_MAX between tries.
+REOPEN_MIN = 0.05
+REOPEN_MAX = 1.0
 running = True
 
 
-class Stats:
-    def __init__(self, usb_path, uart_path):
-        self.path = os.path.join(STATS_DIR, os.path.basename(usb_path) + ".json")
-        self.data = {
-            "usb": usb_path, "uart": uart_path, "pid": os.getpid(),
-            "started": time.monotonic(), "host_bytes": 0, "uart_bytes": 0,
-            "last_host_rx": None, "last_uart_rx": None, "updated": None,
-        }
-        self._next = 0.0
-
-    def note(self, from_host, count):
-        now = time.monotonic()
-        if from_host:
-            self.data["host_bytes"] += count
-            self.data["last_host_rx"] = now
-        else:
-            self.data["uart_bytes"] += count
-            self.data["last_uart_rx"] = now
-
-    def flush(self, force=False):
-        now = time.monotonic()
-        if not force and now < self._next:
-            return
-        self._next = now + 1.0
-        self.data["updated"] = now
-        try:
-            os.makedirs(STATS_DIR, exist_ok=True)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.data, f)
-            os.rename(tmp, self.path)
-        except OSError:
-            pass  # telemetry only; never stop the bridge for it
+class Hangup(Exception):
+    """EOF on the gadget port; the caller reopens it."""
 
 
 def stop_handler(signum, frame):
@@ -85,60 +86,307 @@ def configure(fd, baud=None):
     termios.tcsetattr(fd, termios.TCSANOW, a)
 
 
-def write_all(fd, data):
-    view = memoryview(data)
-    while view and running:
+class Direction:
+    """One way of the bridge: src -> queue -> dst.
+
+    The common case stays as cheap as the original loop: the queue is empty,
+    the write takes everything, and only two counters move. The clock is read
+    only when data has to wait in the queue, so the delay histogram describes
+    the cases that matter (a stalled or slow destination) and costs nothing
+    otherwise."""
+
+    def __init__(self, name, src, dst):
+        self.name = name
+        self.src = src
+        self.dst = dst
+        self.pending = bytearray()
+        self.pending_since = None
+        self.bytes = 0
+        self.reads = 0
+        self.short_writes = 0
+        self.eagain = 0
+        self.write_errors = 0
+        self.dropped = 0
+        self.max_pending = 0
+        self.max_delay_us = 0
+        self.queued = 0
+        self.reopens = 0
+        self.hist = [0] * HIST_BUCKETS
+
+    def note_delay(self, seconds):
+        us = max(0, int(seconds * 1e6))
+        if us > self.max_delay_us:
+            self.max_delay_us = us
+        bucket = min(HIST_BUCKETS - 1, us.bit_length())
+        self.hist[bucket] += 1
+
+    def accept(self, data):
+        """Forward one read. Returns True when the queue went from empty to
+        non-empty (the caller then also polls dst for writability)."""
+        self.bytes += len(data)
+        self.reads += 1
+        if self.pending:
+            self._queue(data)
+            return False
         try:
-            n = os.write(fd, view)
-            view = view[n:]
+            n = os.write(self.dst, data)
         except BlockingIOError:
-            select.select([], [fd], [], 1)
+            self.eagain += 1
+            n = 0
+        if n == len(data):
+            return False
+        if n:
+            self.short_writes += 1
+        self.pending_since = time.monotonic()
+        self.queued += 1
+        self._queue(data[n:])
+        return True
+
+    def _queue(self, data):
+        self.pending.extend(data)
+        if len(self.pending) > MAX_PENDING:
+            excess = len(self.pending) - MAX_PENDING
+            del self.pending[:excess]
+            self.dropped += excess
+        if len(self.pending) > self.max_pending:
+            self.max_pending = len(self.pending)
+
+    def drain(self):
+        """Write queued bytes. Returns True when the queue became empty."""
+        try:
+            n = os.write(self.dst, self.pending)
+        except BlockingIOError:
+            self.eagain += 1
+            return False
+        if n < len(self.pending):
+            self.short_writes += 1
+        del self.pending[:n]
+        if self.pending:
+            return False
+        self.note_delay(time.monotonic() - self.pending_since)
+        self.pending_since = None
+        return True
+
+    def stats(self):
+        return {
+            "bytes": self.bytes, "reads": self.reads,
+            "short_writes": self.short_writes, "eagain": self.eagain,
+            "write_errors": self.write_errors, "dropped": self.dropped,
+            "pending": len(self.pending), "max_pending": self.max_pending,
+            "queued": self.queued, "reopens": self.reopens,
+            "max_delay_us": self.max_delay_us,
+            "delay_hist_log2_us": self.hist,
+        }
 
 
-def main():
-    if len(sys.argv) != 3:
-        print("usage: k2oh-bridge /dev/ttyGSx /dev/ttySx", file=sys.stderr)
-        return 2
-    usb_path, uart_path = sys.argv[1], sys.argv[2]
-    signal.signal(signal.SIGINT, stop_handler)
-    signal.signal(signal.SIGTERM, stop_handler)
+class Stats:
+    def __init__(self, usb_path, uart_path, options):
+        self.path = os.path.join(STATS_DIR, os.path.basename(usb_path) + ".json")
+        self.base = {
+            "usb": usb_path, "uart": uart_path, "pid": os.getpid(),
+            "started": time.monotonic(), "options": options,
+        }
+        self.last_host_rx = None
+        self.last_uart_rx = None
+        self._seen = (0, 0)
+        self._written = 0.0
+        os.makedirs(STATS_DIR, exist_ok=True)
 
-    flags = os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK
-    usb = os.open(usb_path, flags)
-    uart = os.open(uart_path, flags)
-    configure(usb)
-    configure(uart, BAUD)
-    termios.tcflush(usb, termios.TCIOFLUSH)
-    termios.tcflush(uart, termios.TCIOFLUSH)
-    print("bridge active: %s <-> %s @ 230400" % (usb_path, uart_path), flush=True)
-    stats = Stats(usb_path, uart_path)
-    stats.flush(force=True)
+    def flush(self, to_uart, to_host, force=False):
+        now = time.monotonic()
+        # Receive times at flush resolution (a few seconds), from the
+        # counters: no clock read per packet on the data path.
+        seen = (to_uart.bytes, to_host.bytes, len(to_uart.pending),
+                len(to_host.pending))
+        if seen[0] != self._seen[0]:
+            self.last_host_rx = now
+        if seen[1] != self._seen[1]:
+            self.last_uart_rx = now
+        # Nothing changed: rewrite the file every 30 s only (a heartbeat for
+        # k2oh-ctl), it is most of the CPU of the quiet RS-485 bridge.
+        if not force and seen == self._seen and now - self._written < 30.0:
+            return
+        self._seen = seen
+        self._written = now
+        data = dict(self.base)
+        data.update(
+            updated=now, last_host_rx=self.last_host_rx,
+            last_uart_rx=self.last_uart_rx,
+            # kept for k2oh-ctl's telemetry
+            host_bytes=to_uart.bytes, uart_bytes=to_host.bytes,
+            to_uart=to_uart.stats(), to_host=to_host.stats(),
+        )
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.rename(tmp, self.path)
+        except OSError:
+            pass  # telemetry only; never stop the bridge for it
 
-    try:
-        while running:
-            readable, _, _ = select.select([usb, uart], [], [], 1)
-            stats.flush()
-            for src in readable:
+
+def open_port(path, baud=None):
+    fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    configure(fd, baud)
+    termios.tcflush(fd, termios.TCIOFLUSH)
+    return fd
+
+
+def wait_for_devices(paths, log_every=30.0):
+    """Wait until every port exists (the gadget creates ttyGS* late at boot,
+    and re-creates them after a rebind). Logs the reason, never spins."""
+    last_log = 0.0
+    while running:
+        missing = [p for p in paths if not os.path.exists(p)]
+        if not missing:
+            return True
+        now = time.monotonic()
+        if now - last_log >= log_every:
+            print("waiting for %s" % ", ".join(missing), file=sys.stderr, flush=True)
+            last_log = now
+        time.sleep(0.5)
+    return False
+
+
+def apply_tuning(args):
+    if args.nice:
+        os.nice(args.nice)
+    if args.rr:
+        os.sched_setscheduler(0, os.SCHED_RR, os.sched_param(args.rr))
+    if args.cpu:
+        os.sched_setaffinity(0, {int(c) for c in args.cpu.split(",")})
+
+
+def run(usb, uart, to_uart, to_host, stats, chunk):
+    """The data path. One poll object, registered once; the masks change
+    only when a queue starts or empties (rare), so a normal pass is
+    poll -> read -> write with no per-pass list building or clock read."""
+    by_src = {usb: to_uart, uart: to_host}
+    by_dst = {uart: to_uart, usb: to_host}
+    poller = select.poll()
+    poller.register(usb, select.POLLIN)
+    poller.register(uart, select.POLLIN)
+
+    def remask(fd):
+        # Reading never stops: a full queue drops its oldest bytes instead,
+        # so the kernel buffers behind it never overrun.
+        mask = select.POLLIN
+        if by_dst[fd].pending:
+            mask |= select.POLLOUT
+        poller.modify(fd, mask)
+
+    read = os.read
+    poll = poller.poll
+    pollout = select.POLLOUT
+    monotonic = time.monotonic
+    passes = 0
+    due = False
+    next_flush = monotonic() + FLUSH_EVERY
+    while running:
+        events = poll(QUIET_MS if due else 1000)
+        if not events:
+            if due or monotonic() >= next_flush:
+                stats.flush(to_uart, to_host)
+                next_flush = monotonic() + FLUSH_EVERY
+                due = False
+            continue
+        for fd, ev in events:
+            if ev & pollout:
+                d = by_dst[fd]
+                if d.pending and d.drain():
+                    remask(fd)
+            if ev & ~pollout:  # POLLIN, or POLLHUP/POLLERR to be read out
+                d = by_src[fd]
                 try:
-                    data = os.read(src, 4096)
+                    data = read(fd, chunk)
                 except BlockingIOError:
                     continue
                 if not data:
-                    # The gadget side reports EOF while the host has the
-                    # port closed; wait instead of spinning.
-                    time.sleep(0.05)
+                    if fd == usb:
+                        raise Hangup()
+                    time.sleep(0.05)  # not expected from a UART; never spin
                     continue
-                stats.note(src == usb, len(data))
-                write_all(uart if src == usb else usb, data)
+                if d.accept(data):
+                    remask(d.dst)
+        passes += 1
+        if not passes & 63:
+            now = monotonic()
+            due = now >= next_flush
+            if now >= next_flush + FLUSH_LATE:  # never quiet: write anyway
+                stats.flush(to_uart, to_host)
+                next_flush = now + FLUSH_EVERY
+                due = False
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="k2oh-bridge")
+    parser.add_argument("usb")
+    parser.add_argument("uart")
+    parser.add_argument("--chunk", type=int, default=4096)
+    parser.add_argument("--nice", type=int, default=0)
+    parser.add_argument("--rr", type=int, default=0)
+    parser.add_argument("--cpu", default="")
+    args = parser.parse_args(argv)
+    try:
+        signal.signal(signal.SIGINT, stop_handler)
+        signal.signal(signal.SIGTERM, stop_handler)
+    except ValueError:
+        pass  # not the main thread (tests); the service always is
+    apply_tuning(args)
+
+    if not wait_for_devices((args.usb, args.uart)):
+        return 0  # stopped while waiting
+    usb = open_port(args.usb)
+    uart = open_port(args.uart, BAUD)
+    options = {"chunk": args.chunk, "nice": args.nice, "rr": args.rr,
+               "cpu": args.cpu}
+    print("bridge active: %s <-> %s @ 230400 %s" % (args.usb, args.uart, options),
+          flush=True)
+    to_uart = Direction("to_uart", usb, uart)
+    to_host = Direction("to_host", uart, usb)
+    stats = Stats(args.usb, args.uart, options)
+    stats.flush(to_uart, to_host, force=True)
+    code = 0
+    backoff = REOPEN_MIN
+    try:
+        while running:
+            before = to_uart.bytes
+            try:
+                run(usb, uart, to_uart, to_host, stats, max(1, args.chunk))
+                break  # stopped
+            except Hangup:
+                pass
+            if to_uart.bytes != before or to_uart.reopens == 0:
+                # data flowed since the last reopen: a new hangup, log it once
+                backoff = REOPEN_MIN
+                print("%s: EOF (host closed the port or gadget re-bound); "
+                      "reopening, at most once a second" % args.usb, flush=True)
+            os.close(usb)
+            usb = None
+            time.sleep(backoff)
+            backoff = min(REOPEN_MAX, backoff * 2)
+            if not wait_for_devices((args.usb,)):
+                break
+            usb = open_port(args.usb)
+            to_uart.src = to_host.dst = usb
+            to_uart.reopens += 1
     except OSError as exc:
-        print("bridge error on %s <-> %s: %s" % (usb_path, uart_path, exc), file=sys.stderr, flush=True)
-        return 1
+        for d in (to_uart, to_host):
+            if exc.errno in (errno.EIO, errno.ENODEV, errno.EBADF):
+                d.write_errors += 1
+        reason = {errno.EIO: "port gone (gadget unbound or UART reset)",
+                  errno.ENODEV: "device removed"}.get(exc.errno, "I/O error")
+        print("bridge error on %s <-> %s: %s: %s; exiting so procd restarts it"
+              % (args.usb, args.uart, reason, exc), file=sys.stderr, flush=True)
+        code = 1
     finally:
-        stats.flush(force=True)
+        stats.flush(to_uart, to_host, force=True)
         os.close(uart)
-        os.close(usb)
-    print("bridge stopped: %s <-> %s" % (usb_path, uart_path), flush=True)
-    return 0
+        if usb is not None:
+            os.close(usb)
+    if code == 0:
+        print("bridge stopped: %s <-> %s" % (args.usb, args.uart), flush=True)
+    return code
 
 
 if __name__ == "__main__":
