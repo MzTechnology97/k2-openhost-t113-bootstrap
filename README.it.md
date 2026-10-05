@@ -353,6 +353,7 @@ Cosa manca agli strumenti Creality: sono binari chiusi, registrano meno informaz
 | --- | --- |
 | La stampante non torna dopo l'avvio di prova | Spegni e riaccendi: torna allo slot A. Dallo slot A guarda `/mnt/UDISK/.k2openhost/setup.log`. |
 | Klipper sull'host non si collega | `./helper.sh doctor` controlla i tre canali. Sulla stampante: `logread \| grep -E "k2oh\|bridge"`, `cat /sys/kernel/config/usb_gadget/g1/UDC`. |
+| `lsusb` mostra `0525:a4a6 Linux-USB Serial Gadget` ma non esistono `/dev/ttyUSB0..2` | Il kernel dell'host vede il gadget T113 ma non ha associato il driver generico Linux `usbserial`. Esegui `sudo sh ~/k2-openhost-t113-bootstrap/host/k2oh-host-usbserial install`. Il comando rende persistente `vendor=0x0525 product=0xa4a6` nella configurazione modprobe/modules-load e associa anche un gadget già collegato senza scaricare altri driver seriali. |
 | Lo schermo resta sul logo di avvio | `k2oh-setup status`, `cat /mnt/UDISK/.k2openhost/setup.log`; rilancia `k2oh-setup`. |
 | HelixScreen non raggiunge Moonraker | IP dell'host sbagliato: menu 29 o `k2oh-setup --host <IP>`. Verifica che la stampante raggiunga l'host sulla porta 7125. |
 | Nessuna rete nello slot B via Wi-Fi | Lo slot A non aveva reti salvate, o sono state aggiunte dopo: imposta il Wi-Fi da HelixScreen, oppure copia `/etc/wifi/wpa_supplicant/wpa_supplicant.conf`. |
@@ -374,6 +375,7 @@ Cosa manca agli strumenti Creality: sono binari chiusi, registrano meno informaz
 | `fetch-stock-ota.py` | host | Elenca le versioni Creality, ne scarica una (o l'ultima), verifica l'MD5, tiene `kernel` e `rootfs`. |
 | `install-slot-b.sh` | stampante, slot A | `--check` / scrittura dello slot B, backup, file di setup. |
 | `rootfs/` | — | File aggiunti al filesystem originale. |
+| `host/k2oh-host-usbserial` | host | Rende persistente e attiva l'associazione del driver generico Linux `usbserial` richiesta dal gadget T113 `0525:a4a6` a tre canali `gser`. |
 | [`scripts/t113.sh`](https://github.com/MzTechnology97/k2-openhost-installer-helper/blob/main/scripts/t113.sh) (installer helper) | host | I comandi T113 dell'helper; clona questo repository in `~/k2-openhost-t113-bootstrap`. |
 
 ### Percorsi sulla stampante
