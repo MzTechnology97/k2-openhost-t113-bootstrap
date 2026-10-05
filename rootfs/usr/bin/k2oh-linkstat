@@ -140,9 +140,6 @@ def snapshot():
     return snap
 
 
-HEADER = None
-
-
 def row(prev, cur):
     dt = max(1e-6, cur["t"] - prev["t"])
     out = [("time", time.strftime("%Y-%m-%dT%H:%M:%S"))]
