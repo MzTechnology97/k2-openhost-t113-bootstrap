@@ -7,7 +7,7 @@
 > In modalità OpenHost le **telecamere dell'ugello e della camera** non possono essere gestite dal T113 e vanno ricablate direttamente sull'host Linux esterno; la **porta USB esterna** della stampante non può essere usata per stampare e smette completamente di funzionare in modalità gadget.
 > Leggi l'[esclusione di responsabilità e i limiti hardware](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/it/DISCLAIMER.md) prima di usarlo.
 
-> **Stato: primo avvio sulla stampante di riferimento il 2026-10-06 (0.1.0, avvio di prova, non confermato).** Scrittura dello slot B, avvio di prova, gadget, bridge, `k2oh-ctl` e HelixScreen hanno funzionato. Le schede non sono partite da sole e sono emersi altri cinque problemi; sono tutti corretti nella 0.1.1 (vedi il [changelog](CHANGELOG.md)), che non è ancora validata sull'hardware. L'aggiornamento delle MCU non è ancora stato eseguito sull'hardware.
+> **Stato: lo slot B gira sulla stampante di riferimento dal 6 ottobre 2026** (0.1.1, confermato come predefinito, provato con uno spegnimento completo). La prima installazione (0.1.0) ha trovato sei problemi, corretti nella 0.1.1. Il primo aggiornamento firmware delle MCU (1.1.7.0) ha aggiornato motori, estrusore e RFID, e anche il CFS, che non era stato chiesto; un'immagine CFS personalizzata non è partita. Entrambi sono corretti nella 0.1.2, i cui strumenti girano sulla stampante di riferimento (copiati a mano); l'immagine 0.1.2 non è ancora installata. Vedi [Cosa è stato provato](#cosa-è-stato-provato).
 
 > [!IMPORTANT]
 > **Versione del firmware.** Questo lavoro è stato preparato e provato sul firmware originale della K2 Pro **1.1.0.94**, la versione della stampante di riferimento. Le versioni Creality più recenti sono accettate: lo slot B viene costruito solo se gli script di avvio che modifica sono identici a quelli verificati (vale per la 1.1.7.0), e l'installer avvisa e chiede conferma. **Su firmware diversi dalla 1.1.0.94 il corretto funzionamento del bootstrap e della modalità USB gadget (OTG) del T113 non è garantito.**
@@ -316,14 +316,16 @@ Moonraker spento non vale mai come prova che Klipper sia fermo, e Klippy in `shu
 
 ### Come funziona il passaggio CFS
 
-Lo strumento Creality aggiorna un CFS solo se è elencato in `/tmp/cfs_update.json`. Il formato è stato ricostruito da `mcu_util_485`:
+`mcu_util_485` aggiorna un CFS in due casi:
+- **a ogni esecuzione**, quando `/usr/share/klipper/fw/cfs/version.json` indica un'altra versione applicativa per il boot token dell'unità (`boot_ver` → `app_ver`), con il file `fw/cfs/<boot>-<app>.bin`. Succede con o senza `CFS=1`. Sulla stampante di riferimento, un semplice `apply` dopo lo stage della 1.1.7.0 ha aggiornato così il CFS da 113 a 153. Per questo lo slot B tiene quella lista **vuota** (`{"CFSs": []}`) e quella vera in `version.json.k2oh`: né un avvio né un `apply` semplice toccano il CFS. Solo `apply --cfs` rimette la lista vera, per la sua esecuzione.
+- **con `CFS=1`**, per le unità elencate in `/tmp/cfs_update.json`. Il formato è stato ricostruito da `mcu_util_485`:
 
 ```json
 {"CFSs": [{"uuid": "xx xx xx xx xx xx xx xx xx xx xx xx", "fw": "/usr/share/klipper/fw/cfs/cfs0_050_G32-cfs0_000_153.bin"}]}
 ```
 
 - `uuid` è l'identificativo unico (UniID) a 12 byte dell'unità, in esadecimale minuscolo separato da spazi. Lo strumento confronta esattamente i primi 35 caratteri.
-- `fw` è il file che apre.
+- `fw` è il file che apre. La versione applicativa che scrive nel CFS viene presa dal nome del file, dopo `<boot>-`: il file deve chiamarsi come quello originale (`cfs0_050_G32-cfs0_000_153.bin`).
 
 `apply --cfs` non tira mai a indovinare nessuno dei due valori:
 
@@ -352,7 +354,7 @@ Questa modalità **non implementa un flasher alternativo**. Il wrapper:
 
 1. richiede l'hash SHA-256 dichiarato e lo verifica prima di qualsiasi reset;
 2. ricava dal filename sia il token hardware sia la versione applicativa di base;
-3. crea una copia staging dedicata, la verifica nuovamente e la rende sola-lettura;
+3. crea una copia staging dedicata, la verifica nuovamente e la rende sola-lettura. La copia è `custom-cfs/<sha256>/<boot>-<app>.bin`, con il nome originale: sulla stampante di riferimento una copia chiamata con il suo SHA-256 ha fatto scrivere a `mcu_util_485` la versione applicativa `3cf3385dcbc5`, e il loader del CFS ha rifiutato di avviarla (`start_app NACK`). Lo stock 153 è stato poi riscritto con un normale `mcu_update`;
 4. rifiuta il test se altre schede non-CFS risultano da aggiornare nello slot B;
 5. esegue il primo passaggio stock per ottenere `/tmp/.485_mcu_version`;
 6. accetta soltanto un CFS che corrisponda **esattamente** a boot token, versione applicativa e, se specificato, UniID;
@@ -444,4 +446,7 @@ python3 fetch-stock-ota.py 1.1.0.94 stock         # oppure "latest"
 | `k2oh-setup` con il vero installer HelixScreen (chroot) | HelixScreen installato, host Moonraker impostato; l'avvio del servizio richiede il sistema reale |
 | Controllo del modello (K2 Pro `F012`, scheda `CR0CN200400C10`) | letto dalla stampante di riferimento in sola lettura |
 | Scrittura dello slot B e avvio di prova (0.1.0, stampante di riferimento, 2026-10-06) | Slot B scritto e riletto; ambiente dello slot A e vecchio slot B salvati. L'avvio di prova è partito sullo slot B e ha riportato il prossimo avvio sullo slot A. Gadget, bridge, `k2oh-ctl` (telemetria, power device) e HelixScreen hanno funzionato con l'host. Problemi trovati: schede non avviate (i bridge partivano insieme a `mcu_update`), chiave host SSH diversa, nomi by-id diversi da quelli dello slot A, HelixScreen vedeva 0 MB liberi (nome dell'overlay lungo), attesa di 120 s di HelixScreen. Tutti corretti nella 0.1.1, non ancora avviata. |
-| Aggiornamento | **non ancora eseguito sull'hardware** |
+| `k2oh-mcu-fw update` alla 1.1.7.0 (0.1.1, 6 ottobre 2026) | scaricata e verificata sulla stampante; `apply` ha fermato i bridge, spento e riacceso le MCU ed eseguito `mcu_update`: motori X/Y ed estrusore `mot2_…071` → `081`, RFID `009` → `010`, Main e Nozzle invariate, tutte avviate. È stato **aggiornato anche il CFS (113 → 153) senza `--cfs`**: corretto nella 0.1.2 |
+| Immagine CFS personalizzata con `apply --cfs --cfs-image` (0.1.1, 6 ottobre 2026) | scritta, ma il loader del CFS ha rifiutato di avviarla (`start_app NACK`): il nome della copia ha fatto scrivere a `mcu_util_485` la versione `3cf3385dcbc5`. Ripristinato con un normale `mcu_update` (stock 153). Corretto nella 0.1.2 (nome originale), **non ancora riprovato** |
+| Lista CFS messa da parte nella 0.1.2 (stampante di riferimento) | `mcu_update` con `fw/cfs/version.json` vuoto: tutte le schede avviate, CFS non aggiornato; `hold_cfs_list` e la pulizia del livello scrivibile provati con il BusyBox della stampante |
+| Ancora da provare sull'hardware | un `apply --cfs` originale con la lista messa da parte; un'immagine CFS personalizzata con il nome originale; l'installazione dell'immagine 0.1.2 (i suoi strumenti sono stati copiati a mano nello slot B in uso) |

@@ -29,7 +29,13 @@ are kept (checked against the image's own MD5 list); the image is deleted.
 Flashing uses Creality's own sequence: stop the bridges, power-cycle the MCU
 rail (mcu_reset.sh), run /etc/init.d/mcu_update (mcu_util + mcu_util_485),
 start the bridges again. The stock script flashes every board whose version
-differs from its file and also runs at every boot of slot B. With --cfs a
+differs from its file and also runs at every boot of slot B (k2oh-mcu).
+
+The CFS is the exception: mcu_util_485 flashes a CFS whenever
+fw/cfs/version.json lists another application version for its boot token,
+with or without CFS=1. Slot B keeps that list empty and the real one next
+to it (version.json.k2oh), so neither a boot nor a plain apply touches the
+CFS; only 'apply --cfs' puts the real list back for its run. With --cfs a
 second pass flashes the CFS the way Creality's OTA server does: it writes
 /tmp/cfs_update.json ({"CFSs": [{"uuid": ..., "fw": ...}]}, the format
 mcu_util_485 reads) for the units the first pass reported in loader mode,
@@ -62,7 +68,7 @@ FW_ROOT = os.environ.get("K2OH_FW_ROOT", "/usr/share/klipper/fw")
 ORIG_FW_ROOT = os.environ.get("K2OH_ORIG_FW_ROOT", "/rom/usr/share/klipper/fw")
 SEARCH_URL = "https://www.crealitycloud.com/api/cxy/search/firmwareSoftwareSearch"
 DEFAULT_BOARD = "CR0CN200400C10"
-FW_SUFFIXES = (".bin", "version.json")
+FW_SUFFIXES = (".bin", "version.json", "version.json.k2oh")
 
 
 def die(msg, code=1):
@@ -428,8 +434,50 @@ def read_staged():
         return ""
 
 
+# fw/cfs/version.json is the list mcu_util_485 compares every CFS with (boot
+# token -> application version). On the reference printer a plain 'apply'
+# after staging 1.1.7.0 flashed the CFS 113 -> 153 through that list, although
+# no CFS pass was asked for. Slot B keeps it empty; the real list waits in
+# version.json.k2oh until 'apply --cfs' needs it.
+CFS_LIST = "version.json"
+CFS_HELD = "version.json.k2oh"
+EMPTY_CFS_LIST = '{"CFSs": []}\n'
+
+
+def cfs_list_entries(path):
+    try:
+        with open(path) as f:
+            return json.load(f).get("CFSs") or []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def hold_cfs_list():
+    """Leave fw/cfs/version.json without CFS entries, the real list aside."""
+    cfs_dir = os.path.join(FW_ROOT, "cfs")
+    if not os.path.isdir(cfs_dir):
+        return
+    live = os.path.join(cfs_dir, CFS_LIST)
+    if cfs_list_entries(live):
+        os.replace(live, os.path.join(cfs_dir, CFS_HELD))
+    if not os.path.exists(live):
+        with open(live, "w") as f:
+            f.write(EMPTY_CFS_LIST)
+
+
+def release_cfs_list():
+    """Put the real CFS list back for an 'apply --cfs' run; False if none."""
+    cfs_dir = os.path.join(FW_ROOT, "cfs")
+    held = os.path.join(cfs_dir, CFS_HELD)
+    if not cfs_list_entries(held):
+        return False
+    shutil.copyfile(held, os.path.join(cfs_dir, CFS_LIST))
+    return True
+
+
 def replace_set(src_root, model, label):
-    """Make FW_ROOT/<model> and FW_ROOT/cfs hold exactly src_root's files."""
+    """Make FW_ROOT/<model> and FW_ROOT/cfs hold exactly src_root's files,
+    with the CFS list held aside."""
     for sub in (model, "cfs"):
         for rel in fw_files(os.path.join(FW_ROOT, sub)):
             os.unlink(os.path.join(FW_ROOT, sub, rel))
@@ -437,6 +485,7 @@ def replace_set(src_root, model, label):
             target = os.path.join(FW_ROOT, sub, rel)
             os.makedirs(os.path.dirname(target), exist_ok=True)
             shutil.copy2(os.path.join(src_root, sub, rel), target)
+    hold_cfs_list()
     os.sync()
     print("slot B firmware files now: %s" % label)
 
@@ -568,7 +617,8 @@ def cmd_stage(args):
         print("  - " + name)
     for name in sorted(after - before):
         print("  + " + name)
-    print("Slot B flashes these at its next boot, or now with 'k2oh-mcu-fw apply'.")
+    print("Slot B flashes these at its next boot, or now with 'k2oh-mcu-fw apply'")
+    print("(the CFS only with 'k2oh-mcu-fw apply --cfs').")
     print("Slot A flashes its own files back at its next boot.")
 
 
@@ -792,9 +842,14 @@ def prepare_custom_cfs(args):
     if actual != expected:
         die("custom CFS SHA-256 mismatch: expected %s, got %s" % (expected, actual))
 
-    custom_dir = os.path.join(LIBRARY, "custom-cfs")
+    # mcu_util_485 takes the application version it writes to the CFS from
+    # the file name, after "<boot>-". A name ending in the SHA-256 wrote
+    # "3cf3385dcbc5" as the version on the reference printer, and the CFS
+    # loader then refused to start the application (start_app NACK). So the
+    # staged copy keeps the stock name, one directory per SHA-256.
+    custom_dir = os.path.join(LIBRARY, "custom-cfs", expected)
     os.makedirs(custom_dir, mode=0o700, exist_ok=True)
-    staged = os.path.join(custom_dir, "%s-%s.bin" % (match.group("boot"), expected))
+    staged = os.path.join(custom_dir, "%s-%s.bin" % (match.group("boot"), match.group("app")))
     tmp = staged + ".tmp-%d" % os.getpid()
     try:
         shutil.copyfile(source, tmp)
@@ -965,6 +1020,12 @@ def cmd_apply(args):
         step("stopping the bridges", ["/etc/init.d/k2oh-bridge", "stop"])
         if os.path.exists(CFS_JSON):
             os.unlink(CFS_JSON)
+        # The CFS list is live only for a stock --cfs run: there the first
+        # pass flashes the CFS through it. A custom image goes only through
+        # the second pass, so its first pass runs with the list held.
+        hold_cfs_list()
+        if args.cfs and not custom_cfs and not release_cfs_list():
+            print("  no CFS firmware list in %s: the CFS is not flashed" % os.path.join(FW_ROOT, "cfs"))
         run_mcu_update()
         if args.cfs:
             verify_custom_cfs(custom_cfs)
@@ -985,6 +1046,10 @@ def cmd_apply(args):
     finally:
         if os.path.exists(CFS_JSON):
             os.unlink(CFS_JSON)
+        try:
+            hold_cfs_list()
+        except OSError as exc:
+            failures.append("could not put the CFS firmware list aside (%s): the next boot may flash the CFS" % exc)
         print("starting the bridges")
         if run_live(["/etc/init.d/k2oh-bridge", "start"]) != 0:
             failures.append("the bridges did not start again: run '/etc/init.d/k2oh-bridge start' "

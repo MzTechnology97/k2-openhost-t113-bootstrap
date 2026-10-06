@@ -201,6 +201,7 @@ def apply_env(monkeypatch, tmp_path):
     monkeypatch.setattr(fw, "CFS_JSON", str(tmp_path / "cfs_update.json"))
     monkeypatch.setattr(fw, "RS485_VERSIONS", str(tmp_path / "485_mcu_version.json"))
     monkeypatch.setattr(fw, "LIBRARY", str(tmp_path / "library"))
+    monkeypatch.setattr(fw, "FW_ROOT", str(tmp_path / "fw"))
     state["tmp_path"] = tmp_path
     monkeypatch.setattr(fw.time, "time", lambda: NOW)
     monkeypatch.setattr("builtins.input", lambda prompt="": state["answer"])
@@ -325,6 +326,9 @@ def test_prepare_custom_cfs_stages_verified_copy(apply_env):
     assert spec["app"] == "cfs0_000_153"
     assert spec["sha256"] == digest
     assert pathlib.Path(spec["fw"]).is_file()
+    # stock name: mcu_util_485 writes the version after "<boot>-" to the CFS
+    assert pathlib.Path(spec["fw"]).name == "cfs0_050_G32-cfs0_000_153.bin"
+    assert pathlib.Path(spec["fw"]).parent.name == digest
     assert pathlib.Path(spec["fw"]).read_bytes() == image.read_bytes()
     assert fw.sha256_file(spec["fw"]) == digest
 
@@ -433,3 +437,117 @@ def test_generator_output_is_accepted(monkeypatch):
     decoded, problem = fw.decode_evidence(encode(data))
     assert problem is None
     assert fw.evidence_blockers(decoded, SERIAL, NOW) == []
+
+# --- CFS firmware list --------------------------------------------------------
+
+REAL_LIST = {"CFSs": [{"boot_ver": "cfs0_050_G32", "app_ver": "cfs0_000_153"}]}
+
+
+def cfs_dir(state, live=REAL_LIST, held=None):
+    d = state["tmp_path"] / "fw" / "cfs"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "cfs0_050_G32-cfs0_000_153.bin").write_bytes(b"stock")
+    if live is not None:
+        (d / "version.json").write_text(json.dumps(live))
+    if held is not None:
+        (d / "version.json.k2oh").write_text(json.dumps(held))
+    return d
+
+
+def entries(path):
+    return json.loads(path.read_text())["CFSs"]
+
+
+def test_plain_apply_holds_the_cfs_list(apply_env, monkeypatch):
+    """The first apply after an older stage, with the real list still live."""
+    calls, state = apply_env
+    d = cfs_dir(state)
+    seen = []
+
+    def record(cmd, env=None):
+        if "mcu_update" in " ".join(cmd):
+            seen.append(entries(d / "version.json"))
+        return calls(cmd, env)
+
+    monkeypatch.setattr(fw, "run_live", record)
+    fw.cmd_apply(args(encode(evidence()), yes=True))
+    assert seen == [[]]
+    assert entries(d / "version.json") == []
+    assert entries(d / "version.json.k2oh") == REAL_LIST["CFSs"]
+
+
+def test_stock_cfs_apply_uses_the_real_list_then_holds_it(apply_env, monkeypatch):
+    calls, state = apply_env
+    d = cfs_dir(state, live={"CFSs": []}, held=REAL_LIST)
+    seen = []
+
+    def record(cmd, env=None):
+        if "mcu_update" in " ".join(cmd):
+            seen.append(entries(d / "version.json"))
+        return calls(cmd, env)
+
+    monkeypatch.setattr(fw, "run_live", record)
+    fw.cmd_apply(args(encode(evidence()), yes=True, cfs=True))
+    assert seen[0] == REAL_LIST["CFSs"]
+    assert entries(d / "version.json") == []
+    assert entries(d / "version.json.k2oh") == REAL_LIST["CFSs"]
+
+
+def test_custom_cfs_first_pass_runs_with_the_list_held(apply_env, monkeypatch):
+    calls, state = apply_env
+    d = cfs_dir(state)
+    image, digest = make_custom_image(state["tmp_path"])
+    write_cfs_discovery(pathlib.Path(fw.RS485_VERSIONS), [
+        {"uuid": UUID1, "version": "cfs0_050_G32-cfs0_000_153"},
+    ])
+    seen = []
+
+    def record(cmd, env=None):
+        if "mcu_update" in " ".join(cmd):
+            seen.append(entries(d / "version.json"))
+        return calls(cmd, env)
+
+    monkeypatch.setattr(fw, "run_live", record)
+    fw.cmd_apply(args(encode(evidence()), yes=True, cfs=True, cfs_image=str(image), cfs_sha256=digest))
+    assert seen == [[], []]
+    assert entries(d / "version.json.k2oh") == REAL_LIST["CFSs"]
+
+
+def test_failed_flash_still_holds_the_cfs_list(apply_env, monkeypatch):
+    calls, state = apply_env
+    d = cfs_dir(state, live={"CFSs": []}, held=REAL_LIST)
+    calls.codes[UPDATE] = 1
+    with pytest.raises(SystemExit):
+        fw.cmd_apply(args(encode(evidence()), yes=True, cfs=True))
+    assert entries(d / "version.json") == []
+
+
+def test_replace_set_holds_the_staged_cfs_list(apply_env):
+    _calls, state = apply_env
+    cfs_dir(state, live={"CFSs": []}, held={"CFSs": [{"boot_ver": "x", "app_ver": "old"}]})
+    src = state["tmp_path"] / "set"
+    (src / "F012").mkdir(parents=True)
+    (src / "F012" / "mcu0_120_G32-mcu0_001_000.bin").write_bytes(b"m")
+    (src / "cfs").mkdir()
+    (src / "cfs" / "cfs0_050_G32-cfs0_000_153.bin").write_bytes(b"c")
+    (src / "cfs" / "version.json").write_text(json.dumps(REAL_LIST))
+    fw.replace_set(str(src), "F012", "test")
+    d = state["tmp_path"] / "fw" / "cfs"
+    assert entries(d / "version.json") == []
+    assert entries(d / "version.json.k2oh") == REAL_LIST["CFSs"]
+    assert (state["tmp_path"] / "fw" / "F012" / "mcu0_120_G32-mcu0_001_000.bin").is_file()
+
+
+def test_replace_set_from_a_held_image_keeps_its_held_list(apply_env):
+    """unstage copies slot B's original files, already held at build time."""
+    _calls, state = apply_env
+    cfs_dir(state, live={"CFSs": []}, held={"CFSs": [{"boot_ver": "x", "app_ver": "new"}]})
+    rom = state["tmp_path"] / "rom"
+    (rom / "F012").mkdir(parents=True)
+    (rom / "cfs").mkdir()
+    (rom / "cfs" / "version.json").write_text(json.dumps({"CFSs": []}))
+    (rom / "cfs" / "version.json.k2oh").write_text(json.dumps(REAL_LIST))
+    fw.replace_set(str(rom), "F012", "slot B original")
+    d = state["tmp_path"] / "fw" / "cfs"
+    assert entries(d / "version.json") == []
+    assert entries(d / "version.json.k2oh") == REAL_LIST["CFSs"]
