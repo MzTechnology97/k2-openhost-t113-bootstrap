@@ -316,14 +316,16 @@ Moonraker spento non vale mai come prova che Klipper sia fermo, e Klippy in `shu
 
 ### Come funziona il passaggio CFS
 
-Lo strumento Creality aggiorna un CFS solo se è elencato in `/tmp/cfs_update.json`. Il formato è stato ricostruito da `mcu_util_485`:
+`mcu_util_485` aggiorna un CFS in due casi:
+- **a ogni esecuzione**, quando `/usr/share/klipper/fw/cfs/version.json` indica un'altra versione applicativa per il boot token dell'unità (`boot_ver` → `app_ver`), con il file `fw/cfs/<boot>-<app>.bin`. Succede con o senza `CFS=1`. Sulla stampante di riferimento, un semplice `apply` dopo lo stage della 1.1.7.0 ha aggiornato così il CFS da 113 a 153. Per questo lo slot B tiene quella lista **vuota** (`{"CFSs": []}`) e quella vera in `version.json.k2oh`: né un avvio né un `apply` semplice toccano il CFS. Solo `apply --cfs` rimette la lista vera, per la sua esecuzione.
+- **con `CFS=1`**, per le unità elencate in `/tmp/cfs_update.json`. Il formato è stato ricostruito da `mcu_util_485`:
 
 ```json
 {"CFSs": [{"uuid": "xx xx xx xx xx xx xx xx xx xx xx xx", "fw": "/usr/share/klipper/fw/cfs/cfs0_050_G32-cfs0_000_153.bin"}]}
 ```
 
 - `uuid` è l'identificativo unico (UniID) a 12 byte dell'unità, in esadecimale minuscolo separato da spazi. Lo strumento confronta esattamente i primi 35 caratteri.
-- `fw` è il file che apre.
+- `fw` è il file che apre. La versione applicativa che scrive nel CFS viene presa dal nome del file, dopo `<boot>-`: il file deve chiamarsi come quello originale (`cfs0_050_G32-cfs0_000_153.bin`).
 
 `apply --cfs` non tira mai a indovinare nessuno dei due valori:
 
@@ -352,7 +354,7 @@ Questa modalità **non implementa un flasher alternativo**. Il wrapper:
 
 1. richiede l'hash SHA-256 dichiarato e lo verifica prima di qualsiasi reset;
 2. ricava dal filename sia il token hardware sia la versione applicativa di base;
-3. crea una copia staging dedicata, la verifica nuovamente e la rende sola-lettura;
+3. crea una copia staging dedicata, la verifica nuovamente e la rende sola-lettura. La copia è `custom-cfs/<sha256>/<boot>-<app>.bin`, con il nome originale: sulla stampante di riferimento una copia chiamata con il suo SHA-256 ha fatto scrivere a `mcu_util_485` la versione applicativa `3cf3385dcbc5`, e il loader del CFS ha rifiutato di avviarla (`start_app NACK`). Lo stock 153 è stato poi riscritto con un normale `mcu_update`;
 4. rifiuta il test se altre schede non-CFS risultano da aggiornare nello slot B;
 5. esegue il primo passaggio stock per ottenere `/tmp/.485_mcu_version`;
 6. accetta soltanto un CFS che corrisponda **esattamente** a boot token, versione applicativa e, se specificato, UniID;

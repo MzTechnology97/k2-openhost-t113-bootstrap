@@ -148,6 +148,15 @@ rm "$root/etc/config/fstab.k2oh"
 sed -i -e '/^[[:space:]]*clean_parts$/d' -e '/^[[:space:]].*do_check_format \/dev\/by-name\//d' \
 	"$root/lib/preinit/79_format_partition"
 chmod 0755 "$root/etc/dropbear"
+# The CFS is flashed only by 'k2oh-mcu-fw apply --cfs': mcu_util_485 flashes a
+# CFS whenever fw/cfs/version.json lists another version for it, at every
+# mcu_update. The real list waits in version.json.k2oh.
+cfs="$root/usr/share/klipper/fw/cfs"
+if [ -f "$cfs/version.json" ]; then
+	mv "$cfs/version.json" "$cfs/version.json.k2oh"
+	printf '{"CFSs": []}\n' > "$cfs/version.json"
+	chmod 0644 "$cfs/version.json"
+fi
 printf '%s\n' "$release" > "$root/etc/k2openhost-release"
 APPLY
 release="$(printf 'version=%s\nbuilt=%s\nbase_version=%s\nbase_tested=%s\nbase_kernel_md5=%s\nbase_rootfs_md5=%s' \
@@ -167,6 +176,9 @@ for bin in usr/sbin/wpa_supplicant sbin/udhcpc usr/bin/python3 usr/bin/mcu_util 
 	[ -e "$root/$bin" ] || [ -L "$root/$bin" ] || { echo "the stock rootfs has no /$bin" >&2; exit 1; }
 done
 [ -L "$root/etc/rc.d/S54k2oh-mcu" ] || { echo "k2oh-mcu is not enabled" >&2; exit 1; }
+if grep -q boot_ver "$root/usr/share/klipper/fw/cfs/version.json" 2>/dev/null; then
+	echo "fw/cfs/version.json still lists CFS firmware: every boot would flash the CFS" >&2; exit 1
+fi
 grep -A4 "target.*'/overlay'" "$root/etc/config/fstab" | grep -q "enabled.*'0'" \
 	|| { echo "the rootfs_data overlay is still enabled in /etc/config/fstab" >&2; exit 1; }
 grep -q "option[[:space:]]*check_fs[[:space:]]*'0'" "$root/etc/config/fstab" \

@@ -21,9 +21,14 @@
 # "mcu_reset.sh enable" itself first (export, output, rail on), and steps 1-2
 # run once more when the Main or Nozzle MCU did not answer mcu_update.
 # /tmp/k2oh-mcu.ready holds mcu_update's exit code once step 2 is over.
+#
+# The CFS is never flashed here: mcu_util_485 flashes a CFS whenever
+# fw/cfs/version.json lists another version for it, so that list stays empty
+# and the real one waits in version.json.k2oh for 'k2oh-mcu-fw apply --cfs'.
 
 READY=/tmp/k2oh-mcu.ready
 RESET=/usr/bin/mcu_reset.sh
+CFS_FW=/usr/share/klipper/fw/cfs
 
 log() {
 	logger -t k2oh-mcu "$*"
@@ -41,6 +46,15 @@ power_cycle() {
 	sleep 1
 }
 
+hold_cfs_list() {
+	[ -d "$CFS_FW" ] || return 0
+	if grep -q boot_ver "$CFS_FW/version.json" 2>/dev/null; then
+		mv "$CFS_FW/version.json" "$CFS_FW/version.json.k2oh" \
+			&& log "CFS firmware list put aside: the CFS is flashed only by 'k2oh-mcu-fw apply --cfs'"
+	fi
+	[ -f "$CFS_FW/version.json" ] || printf '{"CFSs": []}\n' > "$CFS_FW/version.json"
+}
+
 # True when mcu_update read a version from both the Main and the Nozzle MCU.
 boards_answered() {
 	grep -q '"mcu0": { "serial": "[^"]*", "version": "[^"]' /tmp/.mcu_version 2>/dev/null \
@@ -56,6 +70,7 @@ start_boards() {
 }
 
 rm -f "$READY"
+hold_cfs_list
 start_boards
 if ! boards_answered; then
 	log "the Main or Nozzle MCU did not answer: once more"

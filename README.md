@@ -327,14 +327,16 @@ Moonraker being down is never taken as proof that Klipper stopped, and Klippy `s
 
 ### How the CFS pass works
 
-Creality's updater flashes a CFS only when `/tmp/cfs_update.json` lists it. Its format was recovered from `mcu_util_485`:
+`mcu_util_485` flashes a CFS in two cases:
+- **at every run**, when `/usr/share/klipper/fw/cfs/version.json` lists another application version for the unit's boot token (`boot_ver` → `app_ver`), using `fw/cfs/<boot>-<app>.bin`. This happens with or without `CFS=1`. On the reference printer, a plain `apply` after staging 1.1.7.0 flashed the CFS 113 → 153 this way. So slot B keeps that list **empty** (`{"CFSs": []}`) and the real one in `version.json.k2oh`: neither a boot nor a plain `apply` touches the CFS. Only `apply --cfs` puts the real list back, for its own run.
+- **with `CFS=1`**, for the units listed in `/tmp/cfs_update.json`. Its format was recovered from `mcu_util_485`:
 
 ```json
 {"CFSs": [{"uuid": "xx xx xx xx xx xx xx xx xx xx xx xx", "fw": "/usr/share/klipper/fw/cfs/cfs0_050_G32-cfs0_000_153.bin"}]}
 ```
 
 - `uuid` is the unit's 12-byte UniID, lowercase hex separated by spaces. The tool compares the first 35 characters exactly.
-- `fw` is the file it opens.
+- `fw` is the file it opens. The application version it writes to the CFS is taken from the file name, after `<boot>-`: the file must be named like the stock one (`cfs0_050_G32-cfs0_000_153.bin`).
 
 `apply --cfs` never guesses either value:
 
@@ -363,7 +365,7 @@ This mode **does not implement an alternative flasher**. The wrapper:
 
 1. requires the independently supplied SHA-256 and verifies it before any reset;
 2. derives both the boot/hardware token and source application revision from the filename;
-3. creates a dedicated staged copy, verifies it again, and makes it read-only;
+3. creates a dedicated staged copy, verifies it again, and makes it read-only. The copy is `custom-cfs/<sha256>/<boot>-<app>.bin`, the stock name: on the reference printer a copy named after its SHA-256 made `mcu_util_485` write `3cf3385dcbc5` as the application version, and the CFS loader refused to start it (`start_app NACK`). The stock 153 was then flashed back with a normal `mcu_update`;
 4. refuses the custom CFS test while any non-CFS board differs from slot-B firmware;
 5. performs the normal stock discovery pass to obtain `/tmp/.485_mcu_version`;
 6. accepts only a CFS whose boot token, application revision and optional UniID match exactly;
