@@ -19,6 +19,8 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NOW = 1_800_000_000
 SERIAL = "TESTSERIAL0001"
+UUID1 = "00 01 02 03 04 05 06 07 08 09 0a 0b"
+UUID2 = "10 11 12 13 14 15 16 17 18 19 1a 1b"
 
 
 def load(name, path):
@@ -197,13 +199,17 @@ def apply_env(monkeypatch, tmp_path):
     monkeypatch.setattr(fw, "cmd_status", lambda args: None)
     monkeypatch.setattr(fw, "read_staged", lambda: None)
     monkeypatch.setattr(fw, "CFS_JSON", str(tmp_path / "cfs_update.json"))
+    monkeypatch.setattr(fw, "RS485_VERSIONS", str(tmp_path / "485_mcu_version.json"))
+    monkeypatch.setattr(fw, "LIBRARY", str(tmp_path / "library"))
+    state["tmp_path"] = tmp_path
     monkeypatch.setattr(fw.time, "time", lambda: NOW)
     monkeypatch.setattr("builtins.input", lambda prompt="": state["answer"])
     return calls, state
 
 
-def args(proof=None, yes=False, cfs=False):
-    return types.SimpleNamespace(host_evidence=proof, moonraker="http://host:7125", yes=yes, cfs=cfs)
+def args(proof=None, yes=False, cfs=False, cfs_image=None, cfs_sha256=None, cfs_uuid=None):
+    return types.SimpleNamespace(host_evidence=proof, moonraker="http://host:7125", yes=yes, cfs=cfs,
+                                 cfs_image=cfs_image, cfs_sha256=cfs_sha256, cfs_uuid=cfs_uuid)
 
 
 @pytest.mark.parametrize("status", ["timeout", "unreachable", "http_error", "malformed", "no_config", "active"])
@@ -299,6 +305,117 @@ def test_cfs_difference_without_cfs_pass_is_not_a_failure(apply_env):
                       "cfs0_050_G32-cfs0_000_150")]
     fw.cmd_apply(args(encode(evidence())))
     assert calls.cmds[-1] == BRIDGE_START
+
+
+def make_custom_image(tmp_path, name="cfs0_050_G32-cfs0_000_153-rfid-diag-ro-v2_1.bin", data=b"custom-cfs-test"):
+    path = tmp_path / name
+    path.write_bytes(data)
+    return path, fw.sha256_file(str(path))
+
+
+def write_cfs_discovery(path, units):
+    path.write_text(json.dumps({"CFSs": units}))
+
+
+def test_prepare_custom_cfs_stages_verified_copy(apply_env):
+    _calls, state = apply_env
+    image, digest = make_custom_image(state["tmp_path"])
+    spec = fw.prepare_custom_cfs(args(cfs=True, cfs_image=str(image), cfs_sha256=digest))
+    assert spec["boot"] == "cfs0_050_G32"
+    assert spec["app"] == "cfs0_000_153"
+    assert spec["sha256"] == digest
+    assert pathlib.Path(spec["fw"]).is_file()
+    assert pathlib.Path(spec["fw"]).read_bytes() == image.read_bytes()
+    assert fw.sha256_file(spec["fw"]) == digest
+
+
+def test_prepare_custom_cfs_rejects_wrong_hash_before_flash(apply_env):
+    calls, state = apply_env
+    image, _digest = make_custom_image(state["tmp_path"])
+    with pytest.raises(SystemExit):
+        fw.cmd_apply(args(encode(evidence()), yes=True, cfs=True, cfs_image=str(image), cfs_sha256="0" * 64))
+    assert calls.cmds == []
+
+
+def test_prepare_custom_cfs_requires_cfs_flag(apply_env):
+    calls, state = apply_env
+    image, digest = make_custom_image(state["tmp_path"])
+    with pytest.raises(SystemExit):
+        fw.cmd_apply(args(encode(evidence()), yes=True, cfs=False, cfs_image=str(image), cfs_sha256=digest))
+    assert calls.cmds == []
+
+
+def test_custom_cfs_same_version_is_planned(apply_env):
+    _calls, state = apply_env
+    image, digest = make_custom_image(state["tmp_path"])
+    spec = fw.prepare_custom_cfs(args(cfs=True, cfs_image=str(image), cfs_sha256=digest))
+    write_cfs_discovery(pathlib.Path(fw.RS485_VERSIONS), [
+        {"uuid": UUID1, "version": "cfs0_050_G32-cfs0_000_153"},
+    ])
+    plan, notes = fw.cfs_plan(spec)
+    assert notes == []
+    assert len(plan) == 1
+    assert plan[0]["uuid"] == UUID1
+    assert plan[0]["from"] == "cfs0_050_G32-cfs0_000_153"
+    assert plan[0]["fw"] == spec["fw"]
+    assert plan[0]["to"].startswith("custom:")
+
+
+def test_custom_cfs_refuses_wrong_stock_application(apply_env):
+    _calls, state = apply_env
+    image, digest = make_custom_image(state["tmp_path"])
+    spec = fw.prepare_custom_cfs(args(cfs=True, cfs_image=str(image), cfs_sha256=digest))
+    write_cfs_discovery(pathlib.Path(fw.RS485_VERSIONS), [
+        {"uuid": UUID1, "version": "cfs0_050_G32-cfs0_000_150"},
+    ])
+    with pytest.raises(fw.StepError, match="no CFS matching"):
+        fw.cfs_plan(spec)
+
+
+def test_custom_cfs_refuses_wrong_hardware_token(apply_env):
+    _calls, state = apply_env
+    image, digest = make_custom_image(state["tmp_path"])
+    spec = fw.prepare_custom_cfs(args(cfs=True, cfs_image=str(image), cfs_sha256=digest))
+    write_cfs_discovery(pathlib.Path(fw.RS485_VERSIONS), [
+        {"uuid": UUID1, "version": "cfs0_050_G30-cfs0_000_153"},
+    ])
+    with pytest.raises(fw.StepError, match="no CFS matching"):
+        fw.cfs_plan(spec)
+
+
+def test_custom_cfs_multiple_matches_require_uuid(apply_env):
+    _calls, state = apply_env
+    image, digest = make_custom_image(state["tmp_path"])
+    write_cfs_discovery(pathlib.Path(fw.RS485_VERSIONS), [
+        {"uuid": UUID1, "version": "cfs0_050_G32-cfs0_000_153"},
+        {"uuid": UUID2, "version": "cfs0_050_G32-cfs0_000_153"},
+    ])
+    spec = fw.prepare_custom_cfs(args(cfs=True, cfs_image=str(image), cfs_sha256=digest))
+    with pytest.raises(fw.StepError, match="use --cfs-uuid"):
+        fw.cfs_plan(spec)
+    spec = fw.prepare_custom_cfs(args(cfs=True, cfs_image=str(image), cfs_sha256=digest, cfs_uuid=UUID2.upper()))
+    plan, _notes = fw.cfs_plan(spec)
+    assert [item["uuid"] for item in plan] == [UUID2]
+
+
+def test_custom_cfs_apply_uses_stock_second_pass_same_version(apply_env):
+    calls, state = apply_env
+    image, digest = make_custom_image(state["tmp_path"])
+    write_cfs_discovery(pathlib.Path(fw.RS485_VERSIONS), [
+        {"uuid": UUID1, "version": "cfs0_050_G32-cfs0_000_153"},
+    ])
+    fw.cmd_apply(args(encode(evidence()), yes=True, cfs=True, cfs_image=str(image), cfs_sha256=digest))
+    assert calls.cmds == [BRIDGE_STOP, RESET, UPDATE, RESET, UPDATE, BRIDGE_START]
+
+
+def test_custom_cfs_refuses_when_other_boards_would_change(apply_env):
+    calls, state = apply_env
+    image, digest = make_custom_image(state["tmp_path"])
+    state["plan"] = [("Nozzle", "noz0_130_G30-noz0_020_000", "-> noz0_130_G30-noz0_021_000",
+                      "noz0_130_G30-noz0_021_000")]
+    with pytest.raises(SystemExit):
+        fw.cmd_apply(args(encode(evidence()), yes=True, cfs=True, cfs_image=str(image), cfs_sha256=digest))
+    assert calls.cmds == []
 
 
 # --- host proof generator ---------------------------------------------------

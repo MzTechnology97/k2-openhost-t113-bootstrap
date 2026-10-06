@@ -344,6 +344,34 @@ Creality's updater flashes a CFS only when `/tmp/cfs_update.json` lists it. Its 
 
 If the first pass reports no CFS in loader mode, nothing is flashed. A CFS left in loader mode is started again by Kalico's Box stack (`box_addr`) at the next Klipper start.
 
+### Custom same-version CFS image
+
+Experimental patches may intentionally keep the same Creality application version as their source image. For example, a diagnostic image built from `cfs0_050_G32-cfs0_000_153.bin` may still report `cfs0_000_153`; normal `apply --cfs` would correctly consider that target "up to date" and skip it.
+
+The bootstrap therefore supports an **explicit, tightly constrained** custom-image path that still delegates the actual flash entirely to Creality's stock updater:
+
+```bash
+k2oh-mcu-fw apply --cfs \
+  --cfs-image /path/cfs0_050_G32-cfs0_000_153-rfid-diag-ro-v2_1.bin \
+  --cfs-sha256 <expected-sha256> \
+  --host-evidence '<host-proof>'
+```
+
+`--cfs-uuid 'xx xx ...'` is optional when stock discovery finds exactly one compatible unit; it becomes mandatory if multiple CFS units expose the same hardware/application identity.
+
+This mode **does not implement an alternative flasher**. The wrapper:
+
+1. requires the independently supplied SHA-256 and verifies it before any reset;
+2. derives both the boot/hardware token and source application revision from the filename;
+3. creates a dedicated staged copy, verifies it again, and makes it read-only;
+4. refuses the custom CFS test while any non-CFS board differs from slot-B firmware;
+5. performs the normal stock discovery pass to obtain `/tmp/.485_mcu_version`;
+6. accepts only a CFS whose boot token, application revision and optional UniID match exactly;
+7. writes `/tmp/cfs_update.json` for that one unit and the verified staged image;
+8. runs `CFS=1 /etc/init.d/mcu_update start`, leaving transfer/erase/start entirely to Creality's original `mcu_util_485`.
+
+There is no generic `--force` switch. A G32/153 image cannot be directed to a G30 unit or to a CFS running a different application generation through this path.
+
 ## Why Creality's updater and not Jacob's
 
 Jacob10383's `motor_updater.py` is a careful open re-implementation of the same protocols and a good reference. For the K2 Pro, slot B uses Creality's own tools:
