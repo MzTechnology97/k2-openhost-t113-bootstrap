@@ -125,6 +125,15 @@ if [ -s /etc/dropbear/authorized_keys ]; then
 	chmod 0600 "$upper/etc/dropbear/authorized_keys"
 	echo "  copied slot A's SSH authorized_keys to slot B"
 fi
+# Same host keys in both slots: otherwise SSH clients report a changed host
+# key ("REMOTE HOST IDENTIFICATION HAS CHANGED") at every slot switch.
+copied=""
+for key in /etc/dropbear/dropbear_*_host_key; do
+	[ -s "$key" ] || continue
+	cp "$key" "$upper/etc/dropbear/" && chmod 0600 "$upper/etc/dropbear/$(basename "$key")" \
+		&& copied="$copied $(basename "$key")"
+done
+[ -n "$copied" ] && echo "  copied slot A's SSH host keys to slot B:$copied"
 if grep -q "network=" /etc/wifi/wpa_supplicant/wpa_supplicant.conf 2>/dev/null; then
 	mkdir -p "$upper/etc/wifi/wpa_supplicant"
 	cp /etc/wifi/wpa_supplicant/wpa_supplicant.conf "$upper/etc/wifi/wpa_supplicant/wpa_supplicant.conf"

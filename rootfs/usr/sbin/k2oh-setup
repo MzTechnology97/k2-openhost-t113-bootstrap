@@ -122,11 +122,46 @@ def point_helix(host, port):
         os.replace(tmp, path)
         log("HelixScreen now uses Moonraker at %s:%s (%s)" % (host, port, path))
         changed = True
+    changed = point_helix_wait(host, port) or changed
     if changed and os.path.exists(HELIX_INIT):
         subprocess.run([HELIX_INIT, "restart"], stdin=subprocess.DEVNULL)
     elif not changed:
         log("HelixScreen settings not found yet; it will ask for the host in its setup wizard")
     return changed
+
+
+WAIT_MARK = "# k2oh-setup: Moonraker runs on the external host"
+
+
+def point_helix_wait(host, port):
+    """Make HelixScreen's boot wait poll Moonraker on the external host.
+
+    Its K2 hook waits up to 120 s for http://127.0.0.1:7125 before starting
+    the UI, and slot B has no local Moonraker. The hook reads
+    HELIX_MOONRAKER_READY_URL; its init script does not load helixscreen.env,
+    so the export goes into the init script itself, on a marked line.
+    """
+    try:
+        with open(HELIX_INIT) as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return False
+    line = 'export HELIX_MOONRAKER_READY_URL="http://%s:%s/server/info"  %s' % (host, port, WAIT_MARK)
+    kept = [x for x in lines if not x.endswith(WAIT_MARK)]
+    if not kept or not kept[0].startswith("#!"):
+        log("%s has no shebang line; HelixScreen keeps its local Moonraker wait" % HELIX_INIT)
+        return False
+    new = kept[:1] + [line] + kept[1:]
+    if new == lines:
+        return False
+    target = os.path.realpath(HELIX_INIT)
+    tmp = target + ".k2oh"
+    with open(tmp, "w") as f:
+        f.write("\n".join(new))
+    os.chmod(tmp, os.stat(target).st_mode & 0o7777)
+    os.replace(tmp, target)
+    log("HelixScreen's boot wait now polls Moonraker at %s:%s" % (host, port))
+    return True
 
 
 TOKEN = os.path.join(K2OH_DIR, "ctl.token")

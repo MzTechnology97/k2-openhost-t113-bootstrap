@@ -65,7 +65,9 @@ k2oh_mount_overlay() {
 		mkdir -p "$upper" "$work"
 	fi
 
-	mount -n -t overlay overlayfs:"$upper" -o rw,noatime,lowerdir=/,upperdir="$upper",workdir="$work" /mnt || {
+	# Short source name, as in stock: a long one makes BusyBox df wrap its
+	# line, and installers that read "df / | tail -1" (HelixScreen) see 0 MB.
+	mount -n -t overlay overlayfs:/overlay -o rw,noatime,lowerdir=/,upperdir="$upper",workdir="$work" /mnt || {
 		k2oh_log "overlay mount failed, continuing on the read-only root"
 		return 1
 	}
