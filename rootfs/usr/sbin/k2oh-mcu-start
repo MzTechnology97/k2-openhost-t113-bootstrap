@@ -15,28 +15,53 @@
 #   2. run the stock mcu_update: it starts every board and reflashes any whose
 #      version differs from slot B's firmware files;
 #   3. start the bridges.
+# The rc.d order is not a guarantee here: procd does not wait for board_init
+# (S20), which exports GPIO140 with "mcu_reset.sh enable", and on the second
+# printer boot GPIO140 did not exist yet when this script ran. So step 1 runs
+# "mcu_reset.sh enable" itself first (export, output, rail on), and steps 1-2
+# run once more when the Main or Nozzle MCU did not answer mcu_update.
 # /tmp/k2oh-mcu.ready holds mcu_update's exit code once step 2 is over.
 
 READY=/tmp/k2oh-mcu.ready
+RESET=/usr/bin/mcu_reset.sh
 
 log() {
 	logger -t k2oh-mcu "$*"
 	echo "k2oh-mcu: $*"
 }
 
-rm -f "$READY"
-if [ -x /usr/bin/mcu_reset.sh ]; then
+power_cycle() {
+	if [ ! -x "$RESET" ]; then
+		log "no $RESET: the MCU rail is not cycled"
+		return 1
+	fi
+	"$RESET" enable || log "$RESET enable failed (exit $?)"
 	log "power-cycling the MCU rail"
-	/usr/bin/mcu_reset.sh || log "mcu_reset.sh failed (exit $?)"
+	"$RESET" || { log "$RESET failed (exit $?)"; return 1; }
 	sleep 1
-else
-	log "no /usr/bin/mcu_reset.sh: the MCU rail is not cycled"
-fi
+}
 
-log "running the stock mcu_update (it can take minutes when it flashes)"
-/etc/init.d/mcu_update start
-rc=$?
-log "mcu_update exit $rc, versions: $(tr -d '\n' < /tmp/.mcu_version 2>/dev/null)"
+# True when mcu_update read a version from both the Main and the Nozzle MCU.
+boards_answered() {
+	grep -q '"mcu0": { "serial": "[^"]*", "version": "[^"]' /tmp/.mcu_version 2>/dev/null \
+		&& grep -q '"noz0": { "serial": "[^"]*", "version": "[^"]' /tmp/.mcu_version 2>/dev/null
+}
+
+start_boards() {
+	power_cycle
+	log "running the stock mcu_update (it can take minutes when it flashes)"
+	/etc/init.d/mcu_update start
+	rc=$?
+	log "mcu_update exit $rc, versions: $(tr -d '\n' < /tmp/.mcu_version 2>/dev/null)"
+}
+
+rm -f "$READY"
+start_boards
+if ! boards_answered; then
+	log "the Main or Nozzle MCU did not answer: once more"
+	start_boards
+	boards_answered || log "the Main or Nozzle MCU still did not answer; see /tmp/mcu_update.log"
+fi
 echo "$rc" > "$READY"
 
 log "starting the bridges"
