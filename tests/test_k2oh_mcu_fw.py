@@ -189,7 +189,7 @@ def apply_env(monkeypatch, tmp_path):
     calls = Calls()
     state = {"moonraker": {"status": "stopped", "detail": "Klippy is disconnected"},
              "plan": [("Main", "mcu0_120_G32-mcu0_001_000", "up to date", "mcu0_120_G32-mcu0_001_000")],
-             "answer": "flash"}
+             "answer": "flash", "verified_cfs_plans": []}
     monkeypatch.setattr(fw, "require_slot_b", lambda: None)
     monkeypatch.setattr(fw, "model_dir", lambda: "F012")
     monkeypatch.setattr(fw, "moonraker_state", lambda url, timeout=5: dict(state["moonraker"]))
@@ -198,6 +198,8 @@ def apply_env(monkeypatch, tmp_path):
     monkeypatch.setattr(fw, "board_plan", lambda model: list(state["plan"]))
     monkeypatch.setattr(fw, "cmd_status", lambda args: None)
     monkeypatch.setattr(fw, "read_staged", lambda: None)
+    monkeypatch.setattr(fw, "verify_cfs_update_results",
+                        lambda plan: state["verified_cfs_plans"].append(list(plan)))
     monkeypatch.setattr(fw, "CFS_JSON", str(tmp_path / "cfs_update.json"))
     monkeypatch.setattr(fw, "RS485_VERSIONS", str(tmp_path / "485_mcu_version.json"))
     monkeypatch.setattr(fw, "LIBRARY", str(tmp_path / "library"))
@@ -308,14 +310,77 @@ def test_cfs_difference_without_cfs_pass_is_not_a_failure(apply_env):
     assert calls.cmds[-1] == BRIDGE_START
 
 
-def make_custom_image(tmp_path, name="cfs0_050_G32-cfs0_000_153-rfid-diag-ro-v2_1.bin", data=b"custom-cfs-test"):
+def make_custom_image(tmp_path, name="cfs0_050_G32-cfs0_000_153-rfid-diag-ro-v2_1.bin", data=None):
     path = tmp_path / name
+    if data is None:
+        image = bytearray(0x300)
+        image[0:4] = (0x20001000).to_bytes(4, "little")
+        image[4:8] = (0x08010101).to_bytes(4, "little")
+        image[0x200:0x20c] = b"cfs0_000_153"
+        image[0x20c:0x212] = b"\x00" * 6
+        crc = fw.creality_cfs_crc16(image)
+        image[0x20c:0x20e] = crc.to_bytes(2, "little")
+        image[0x20e:0x212] = len(image).to_bytes(4, "little")
+        data = bytes(image)
     path.write_bytes(data)
     return path, fw.sha256_file(str(path))
 
 
+def test_creality_cfs_crc16_reference_vector():
+    assert fw.creality_cfs_crc16(b"123456789") == 0xFEE8
+
+
+def test_custom_cfs_container_rejects_bad_declared_length(apply_env):
+    _calls, state = apply_env
+    image, _digest = make_custom_image(state["tmp_path"])
+    data = bytearray(image.read_bytes())
+    data[0x20e:0x212] = (len(data) - 1).to_bytes(4, "little")
+    image.write_bytes(data)
+    with pytest.raises(fw.StepError, match="declared image length"):
+        fw.validate_custom_cfs_container(str(image), "cfs0_000_153")
+
+
+def test_custom_cfs_container_rejects_bad_crc(apply_env):
+    _calls, state = apply_env
+    image, _digest = make_custom_image(state["tmp_path"])
+    data = bytearray(image.read_bytes())
+    data[-1] ^= 0x01
+    image.write_bytes(data)
+    with pytest.raises(fw.StepError, match="CRC16 mismatch"):
+        fw.validate_custom_cfs_container(str(image), "cfs0_000_153")
+
+
+def test_custom_cfs_container_rejects_internal_version_mismatch(apply_env):
+    _calls, state = apply_env
+    image, _digest = make_custom_image(state["tmp_path"])
+    with pytest.raises(fw.StepError, match="does not match filename"):
+        fw.validate_custom_cfs_container(str(image), "cfs0_000_150")
+
+
 def write_cfs_discovery(path, units):
     path.write_text(json.dumps({"CFSs": units}))
+
+
+def test_targeted_cfs_result_requires_ok(monkeypatch, tmp_path):
+    path = tmp_path / "485.json"
+    monkeypatch.setattr(fw, "RS485_VERSIONS", str(path))
+    plan = [{"uuid": UUID1}]
+    write_cfs_discovery(path, [{"uuid": UUID1, "update": "ok"}])
+    fw.verify_cfs_update_results(plan)
+    write_cfs_discovery(path, [{"uuid": UUID1, "update": "fail"}])
+    with pytest.raises(fw.StepError, match="update='fail'"):
+        fw.verify_cfs_update_results(plan)
+    write_cfs_discovery(path, [{"uuid": UUID1, "update": "done"}])
+    with pytest.raises(fw.StepError, match="update='done'"):
+        fw.verify_cfs_update_results(plan)
+
+
+def test_targeted_cfs_result_requires_matching_uuid(monkeypatch, tmp_path):
+    path = tmp_path / "485.json"
+    monkeypatch.setattr(fw, "RS485_VERSIONS", str(path))
+    write_cfs_discovery(path, [{"uuid": UUID2, "update": "ok"}])
+    with pytest.raises(fw.StepError, match="has no result"):
+        fw.verify_cfs_update_results([{"uuid": UUID1}])
 
 
 def test_prepare_custom_cfs_stages_verified_copy(apply_env):
@@ -410,6 +475,8 @@ def test_custom_cfs_apply_uses_stock_second_pass_same_version(apply_env):
     ])
     fw.cmd_apply(args(encode(evidence()), yes=True, cfs=True, cfs_image=str(image), cfs_sha256=digest))
     assert calls.cmds == [BRIDGE_STOP, RESET, UPDATE, RESET, UPDATE, BRIDGE_START]
+    assert len(state["verified_cfs_plans"]) == 1
+    assert state["verified_cfs_plans"][0][0]["uuid"] == UUID1
 
 
 def test_custom_cfs_refuses_when_other_boards_would_change(apply_env):
@@ -551,3 +618,5 @@ def test_replace_set_from_a_held_image_keeps_its_held_list(apply_env):
     d = state["tmp_path"] / "fw" / "cfs"
     assert entries(d / "version.json") == []
     assert entries(d / "version.json.k2oh") == REAL_LIST["CFSs"]
+
+[executed on device: K2-OpenHost (89cb063b-3b3d-4426-afdd-42400b8c7ae2)]
