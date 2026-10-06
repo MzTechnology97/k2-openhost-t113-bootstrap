@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.2
+
+Fixes from the first MCU firmware updates on the reference printer (2026-10-06):
+
+- **The CFS is flashed only by `apply --cfs`.** `mcu_util_485` flashes a CFS at every run when `fw/cfs/version.json` lists another version for it, with or without `CFS=1`: a plain `apply` after staging 1.1.7.0 flashed the CFS 113 → 153, and every boot of slot B would have done the same. Slot B now keeps that list empty and the real one in `version.json.k2oh`: the build, `stage`/`unstage`, every `apply` and `k2oh-mcu` at boot put it aside, and only `apply --cfs` puts it back for its own run. A custom image goes only through the `CFS=1` pass. Checked on the printer: with the empty list, motors, RFID and CFS start normally and the CFS is not flashed.
+- **Custom CFS images keep the stock file name.** The staged copy was `custom-cfs/<boot>-<sha256>.bin`, and `mcu_util_485` takes the application version it writes to the CFS from the file name: it wrote `3cf3385dcbc5`, and the CFS loader refused to start the application (`start_app NACK`). The copy is now `custom-cfs/<sha256>/<boot>-<app>.bin`. The CFS was recovered with a normal `mcu_update` (stock 153).
+- **A reinstall drops old copies of K2-OpenHost's programs from the writable layer** (`/etc/init.d/k2oh-*`, `/usr/bin/k2oh-*`, `/usr/sbin/k2oh-*`, `chamber_cam_power.sh`), so a fix copied by hand before a release never hides the new image's version.
+
 ## 0.1.1
 
 Fixes from the first boot of slot B on the reference printer (0.1.0, trial boot, 2026-10-06):

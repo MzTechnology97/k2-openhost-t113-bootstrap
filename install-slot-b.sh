@@ -120,6 +120,14 @@ say "Preparing the slot B writable layer"
 upper="$K2OH_DIR/overlay/upper"
 mkdir -p "$upper/etc/dropbear" "$K2OH_DIR/overlay/work" "$K2OH_DIR/bin"
 chmod 0755 "$upper/etc" "$upper/etc/dropbear"
+# K2-OpenHost's own programs come from the new image. A copy left in the
+# writable layer (a fix copied by hand before a release, or a deletion
+# marker) would hide the new version, so it goes.
+for f in "$upper"/etc/init.d/k2oh-* "$upper"/usr/bin/k2oh-* "$upper"/usr/sbin/k2oh-* \
+	"$upper"/usr/bin/chamber_cam_power.sh; do
+	[ -e "$f" ] || [ -L "$f" ] || continue
+	rm -f "$f" && echo "  removed the old copy of /${f#"$upper"/} from the writable layer"
+done
 if [ -s /etc/dropbear/authorized_keys ]; then
 	cp /etc/dropbear/authorized_keys "$upper/etc/dropbear/authorized_keys"
 	chmod 0600 "$upper/etc/dropbear/authorized_keys"
