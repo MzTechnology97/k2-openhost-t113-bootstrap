@@ -1244,5 +1244,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-[executed on device: K2-OpenHost (89cb063b-3b3d-4426-afdd-42400b8c7ae2)]
