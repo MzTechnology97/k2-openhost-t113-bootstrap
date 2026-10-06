@@ -156,8 +156,8 @@ Il sistema dello slot B è un'immagine in sola lettura in `rootfsB`, che si può
 
 | Azione | Menu | Comando |
 | --- | --- | --- |
-| Aggiornare i programmi | 32 | `./helper.sh t113 update` |
-| Tornare ai programmi dell'immagine | 32 | `./helper.sh t113 update --revert` |
+| Aggiornare i programmi | 33 | `./helper.sh t113 update` |
+| Tornare ai programmi dell'immagine | 33 | `./helper.sh t113 update --revert` |
 
 1. `make-update-bundle.sh` raccoglie `/etc/init.d/k2oh-*`, `/usr/bin/k2oh-*`, `/usr/sbin/k2oh-*`, `chamber_cam_power.sh`, i collegamenti di avvio di `rootfs-services.txt` e `VERSION`, con le somme SHA-256.
 2. Sulla stampante, `update-slot-b.sh --check` elenca i programmi e i collegamenti di avvio che cambiano, e dice se valgono subito o dal prossimo riavvio. Non scrive niente.
