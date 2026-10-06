@@ -7,7 +7,7 @@
 > In modalità OpenHost le **telecamere dell'ugello e della camera** non possono essere gestite dal T113 e vanno ricablate direttamente sull'host Linux esterno; la **porta USB esterna** della stampante non può essere usata per stampare e smette completamente di funzionare in modalità gadget.
 > Leggi l'[esclusione di responsabilità e i limiti hardware](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/it/DISCLAIMER.md) prima di usarlo.
 
-> **Stato: costruito e provato offline, non ancora avviato su una stampante.** Ogni parte descritta qui è stata verificata sul CM5 di riferimento: build, confronti file per file, binari ARM e Python della stampante in un chroot, download reali da Creality e GitHub. La scrittura dello slot B, il suo avvio e l'aggiornamento delle MCU non sono ancora stati eseguiti sull'hardware.
+> **Stato: primo avvio sulla stampante di riferimento il 2026-10-06 (0.1.0, avvio di prova, non confermato).** Scrittura dello slot B, avvio di prova, gadget, bridge, `k2oh-ctl` e HelixScreen hanno funzionato. Le schede non sono partite da sole e sono emersi altri cinque problemi; sono tutti corretti nella 0.1.1 (vedi il [changelog](CHANGELOG.md)), che non è ancora validata sull'hardware. L'aggiornamento delle MCU non è ancora stato eseguito sull'hardware.
 
 > [!IMPORTANT]
 > **Versione del firmware.** Questo lavoro è stato preparato e provato sul firmware originale della K2 Pro **1.1.0.94**, la versione della stampante di riferimento. Le versioni Creality più recenti sono accettate: lo slot B viene costruito solo se gli script di avvio che modifica sono identici a quelli verificati (vale per la 1.1.7.0), e l'installer avvisa e chiede conferma. **Su firmware diversi dalla 1.1.0.94 il corretto funzionamento del bootstrap e della modalità USB gadget (OTG) del T113 non è garantito.**
@@ -126,7 +126,7 @@ host esterno (helper.sh)                               T113 della stampante, slo
 11. **Conferma** per scrivere lo slot B. La stampante:
     - salva l'ambiente U-Boot e il vecchio slot B in `/mnt/UDISK/.k2openhost/backup/<data>/`;
     - scrive `bootB` e `rootfsB` e li rilegge;
-    - prepara il livello scrivibile dello slot B: copia le `authorized_keys` SSH e le reti Wi-Fi salvate dello slot A, salva l'IP dell'host in `/mnt/UDISK/.k2openhost/k2openhost.conf` e tiene l'archivio di HelixScreen per il primo avvio.
+    - prepara il livello scrivibile dello slot B: copia le `authorized_keys` SSH, le chiavi host SSH (la stampante ha la stessa identità nei due slot) e le reti Wi-Fi salvate dello slot A, salva l'IP dell'host in `/mnt/UDISK/.k2openhost/k2openhost.conf` e tiene l'archivio di HelixScreen per il primo avvio.
 12. Lo slot A resta quello di avvio predefinito. Prosegui con l'avvio di prova.
 
 ## Avvio di prova, conferma, ritorno
@@ -153,10 +153,10 @@ Dopo l'avvio di prova:
 
 | Parte | Dettaglio |
 | --- | --- |
-| `k2oh-gadget` | Mette la USB0 in modalità device e crea tre funzioni Generic Serial (`0525:a4a6`, interfacce 00/01/02), come si aspettano le regole udev dell'host. |
+| `k2oh-gadget` | Mette la USB0 in modalità device e crea tre funzioni Generic Serial (`0525:a4a6`, interfacce 00/01/02), come si aspettano le regole udev dell'host. Si presenta come `Creality K2 Pro` / `K2-OpenHost Gadget Serial` con il numero di serie della stampante, quindi i suoi nomi in `/dev/serial/by-id` sono diversi da quelli del gadget originale dello slot A (`usb-Allwinner_Technology_Inc._Gadget_Serial-…`). Sull'host usa i nomi udev `/dev/k2-main`, `/dev/k2-nozzle` e `/dev/k2-rs485`: sono uguali nei due slot. |
 | `k2oh-bridge` | Un processo bridge per bus: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motori, 230400 8N1. Ogni direzione ha la sua coda non bloccante, così un lato fermo non blocca mai l'altro. Attende le porte mancanti invece di uscire, e riapre la porta del gadget dopo una riconnessione USB (il vecchio descrittore restituisce solo EOF). Dopo un crash procd lo riavvia in 1 s, prima che Klipper rinunci alla sua MCU (circa 5 s). I contatori vanno in `/tmp/k2oh-bridge/`. Opzioni in `k2openhost.conf` come `BRIDGE_OPTS="..."` (`--chunk`, `--nice`, `--rr`, `--cpu`); il predefinito è nessuna, scelto in base ai [benchmark](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/it/USB_BRIDGE.md). |
 | `k2oh-linkstat` | Campionatore opzionale per stampe lunghe: CPU, interrupt, differenze degli errori UART, stato del gadget e contatori dei bridge ogni 10 s in un CSV in RAM. Si avvia a mano: `k2oh-linkstat --out /tmp/k2oh-linkstat.csv &`. |
-| `mcu_update` (originale) | Resta: a ogni avvio avvia le applicazioni di Main e Nozzle MCU (si accendono nel loader Creality), e riscrive ogni scheda la cui versione è diversa dai file firmware dello slot B. |
+| `k2oh-mcu` (S54) | A ogni avvio, un passo dopo l'altro: spegne e riaccende l'alimentazione delle MCU (`mcu_reset.sh` originale), esegue `mcu_update` di Creality, poi avvia i bridge. `mcu_update` avvia ogni scheda dal suo loader e riscrive ogni scheda la cui versione è diversa dai file firmware dello slot B. Nello slot B non ha un suo collegamento di avvio: al primo avvio procd lo ha eseguito mentre i bridge leggevano già gli stessi UART, l'handshake è fallito e le schede sono rimaste nel loader. Lo spegnimento copre anche il riavvio della sola T113, che lascia le schede con la sessione precedente dell'host. Log: `logread -e k2oh-mcu`, `/tmp/mcu_update.log`. |
 | `k2oh-ctl` | Servizio di controllo per l'host esterno: telemetria, alimentazione delle MCU, buzzer, bridge, HelixScreen. Vedi [Servizio di controllo](#servizio-di-controllo-k2oh-ctl). |
 | `k2oh-wifi` | Avvia `wpa_supplicant` e `udhcpc` come faceva il `wifi-server` Creality, con le reti copiate dallo slot A. L'Ethernet funziona come nell'originale. |
 | `k2oh-firstboot` / `k2oh-setup` | Primo avvio: installa HelixScreen dall'archivio preparato e lo collega a `HOST_IP:7125`. Riprova a ogni avvio finché non riesce. `k2oh-setup --host <IP>` cambia l'host in seguito (menu 29). |
@@ -380,7 +380,7 @@ Cosa manca agli strumenti Creality: sono binari chiusi, registrano meno informaz
 | Sintomo | Cosa fare |
 | --- | --- |
 | La stampante non torna dopo l'avvio di prova | Spegni e riaccendi: torna allo slot A. Dallo slot A guarda `/mnt/UDISK/.k2openhost/setup.log`. |
-| Klipper sull'host non si collega | `./helper.sh doctor` controlla i tre canali. Sulla stampante: `logread \| grep -E "k2oh\|bridge"`, `cat /sys/kernel/config/usb_gadget/g1/UDC`. |
+| Klipper sull'host non si collega | `./helper.sh doctor` controlla i tre canali. Sulla stampante: `logread \| grep -E "k2oh\|bridge"`, `cat /sys/kernel/config/usb_gadget/g1/UDC`. Le versioni vuote in `/tmp/.mcu_version` vogliono dire che le schede non hanno risposto all'handshake Creality: esegui `/etc/init.d/k2oh-bridge stop`, `mcu_reset.sh`, `/etc/init.d/mcu_update start` e `/etc/init.d/k2oh-bridge start`, poi `FIRMWARE_RESTART`. Se `printer.cfg` usa i nomi by-id `usb-Allwinner_…` dello slot A, passa a `/dev/k2-*` (installer helper: `config serial-names --udev`). |
 | `lsusb` mostra `0525:a4a6 Linux-USB Serial Gadget` ma non esistono `/dev/ttyUSB0..2` | Il kernel dell'host vede il gadget T113 ma non ha associato il driver generico Linux `usbserial`. Esegui `sudo sh ~/k2-openhost-t113-bootstrap/host/k2oh-host-usbserial install`. Il comando rende persistente `vendor=0x0525 product=0xa4a6` nella configurazione modprobe/modules-load e associa anche un gadget già collegato senza scaricare altri driver seriali. |
 | Lo schermo resta sul logo di avvio | `k2oh-setup status`, `cat /mnt/UDISK/.k2openhost/setup.log`; rilancia `k2oh-setup`. |
 | HelixScreen non raggiunge Moonraker | IP dell'host sbagliato: menu 29 o `k2oh-setup --host <IP>`. Verifica che la stampante raggiunga l'host sulla porta 7125. |
@@ -443,4 +443,5 @@ python3 fetch-stock-ota.py 1.1.0.94 stock         # oppure "latest"
 | Piano CFS con unità simulate | variante esatta scelta; unità aggiornate, non valide e sconosciute saltate |
 | `k2oh-setup` con il vero installer HelixScreen (chroot) | HelixScreen installato, host Moonraker impostato; l'avvio del servizio richiede il sistema reale |
 | Controllo del modello (K2 Pro `F012`, scheda `CR0CN200400C10`) | letto dalla stampante di riferimento in sola lettura |
-| Scrittura dello slot B, avvio di prova, aggiornamento | **non ancora eseguiti sull'hardware** |
+| Scrittura dello slot B e avvio di prova (0.1.0, stampante di riferimento, 2026-10-06) | Slot B scritto e riletto; ambiente dello slot A e vecchio slot B salvati. L'avvio di prova è partito sullo slot B e ha riportato il prossimo avvio sullo slot A. Gadget, bridge, `k2oh-ctl` (telemetria, power device) e HelixScreen hanno funzionato con l'host. Problemi trovati: schede non avviate (i bridge partivano insieme a `mcu_update`), chiave host SSH diversa, nomi by-id diversi da quelli dello slot A, HelixScreen vedeva 0 MB liberi (nome dell'overlay lungo), attesa di 120 s di HelixScreen. Tutti corretti nella 0.1.1, non ancora avviata. |
+| Aggiornamento | **non ancora eseguito sull'hardware** |

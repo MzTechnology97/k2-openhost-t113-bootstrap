@@ -41,7 +41,9 @@ PREINIT_SHA256="01f37a5623b907a549af30a087927f9135442e461639caf43740dbdab72dbc9b
 
 # Init scripts disabled in slot B (their /etc/rc.d links are removed).
 # wipe_data is the factory reset: it deletes most of UDISK, which slot A uses.
-DISABLED_SERVICES="klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data S99swupdate_autorun"
+# mcu_update is run by k2oh-mcu instead (after a power cycle, before the
+# bridges): procd ran it in parallel with the bridges on the first boot.
+DISABLED_SERVICES="klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data S99swupdate_autorun mcu_update"
 
 kernel="" rootfs="" out="" tools="" base_version="" force_preinit=0
 while [ $# -gt 0 ]; do
@@ -117,13 +119,14 @@ done
 for svc in $disabled; do
 	rm -f "$root"/etc/rc.d/[SK][0-9][0-9]"${svc#S99}"
 done
-# Wi-Fi after network (S20), gadget and bridges after mcu_update (S13) and
-# board_init (S20), first-boot setup last.
+# Wi-Fi after network (S20); after board_init (S20): k2oh-mcu (power cycle,
+# stock mcu_update, then the bridges) and the gadget; first-boot setup last.
+# The bridges have no S link: k2oh-mcu starts them once the boards are up.
 ln -sf ../init.d/k2oh-wifi "$root/etc/rc.d/S22k2oh-wifi"
 ln -sf ../init.d/k2oh-wifi "$root/etc/rc.d/K89k2oh-wifi"
 ln -sf ../init.d/k2oh-gadget "$root/etc/rc.d/S55k2oh-gadget"
 ln -sf ../init.d/k2oh-gadget "$root/etc/rc.d/K11k2oh-gadget"
-ln -sf ../init.d/k2oh-bridge "$root/etc/rc.d/S56k2oh-bridge"
+ln -sf ../init.d/k2oh-mcu "$root/etc/rc.d/S54k2oh-mcu"
 ln -sf ../init.d/k2oh-bridge "$root/etc/rc.d/K10k2oh-bridge"
 ln -sf ../init.d/k2oh-ctl "$root/etc/rc.d/S57k2oh-ctl"
 ln -sf ../init.d/k2oh-ctl "$root/etc/rc.d/K09k2oh-ctl"
@@ -153,14 +156,17 @@ release="$(printf 'version=%s\nbuilt=%s\nbase_version=%s\nbase_tested=%s\nbase_k
 fakeroot -i "$state" -s "$state" bash "$work/apply.sh" "$root" "$HERE/rootfs" "$DISABLED_SERVICES" "$release"
 
 say "Checking the result"
-for svc in klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data swupdate_autorun; do
-	if ls "$root"/etc/rc.d/ | grep -qx "[SK][0-9][0-9]$svc"; then
+for svc in klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data swupdate_autorun mcu_update k2oh-bridge; do
+	# k2oh-bridge keeps its K link (stopped at shutdown), not an S link
+	if ls "$root"/etc/rc.d/ | grep -qx "S[0-9][0-9]$svc" \
+		|| { [ "$svc" != k2oh-bridge ] && ls "$root"/etc/rc.d/ | grep -qx "K[0-9][0-9]$svc"; }; then
 		echo "service $svc is still enabled" >&2; exit 1
 	fi
 done
 for bin in usr/sbin/wpa_supplicant sbin/udhcpc usr/bin/python3 usr/bin/mcu_util usr/bin/mcu_util_485 usr/bin/mcu_reset.sh; do
 	[ -e "$root/$bin" ] || [ -L "$root/$bin" ] || { echo "the stock rootfs has no /$bin" >&2; exit 1; }
 done
+[ -L "$root/etc/rc.d/S54k2oh-mcu" ] || { echo "k2oh-mcu is not enabled" >&2; exit 1; }
 grep -A4 "target.*'/overlay'" "$root/etc/config/fstab" | grep -q "enabled.*'0'" \
 	|| { echo "the rootfs_data overlay is still enabled in /etc/config/fstab" >&2; exit 1; }
 grep -q "option[[:space:]]*check_fs[[:space:]]*'0'" "$root/etc/config/fstab" \
