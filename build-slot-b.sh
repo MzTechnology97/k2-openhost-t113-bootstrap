@@ -39,11 +39,11 @@ TESTED_BASES="1.1.0.94:42ced67cb382d6919737a15aab658ff6:ea8da1a09c56eb33175822f8
 PREINIT_SHA256="01f37a5623b907a549af30a087927f9135442e461639caf43740dbdab72dbc9b  lib/preinit/80_mount_root
 56a5345e53f16a89f8be93747c2812d0bed1755decd21b7c53e5c3dc37482b98  lib/preinit/79_format_partition"
 
-# Init scripts disabled in slot B (their /etc/rc.d links are removed).
-# wipe_data is the factory reset: it deletes most of UDISK, which slot A uses.
-# mcu_update is run by k2oh-mcu instead (after a power cycle, before the
-# bridges): procd ran it in parallel with the bridges on the first boot.
-DISABLED_SERVICES="klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data S99swupdate_autorun mcu_update"
+# Boot links of slot B: stock services turned off and K2-OpenHost's own
+# (rootfs-services.txt, shared with update-slot-b.sh).
+SERVICES_SPEC="$HERE/rootfs-services.txt"
+DISABLED_SERVICES="$(awk '$1 == "disable" {print $2}' "$SERVICES_SPEC" | tr '\n' ' ' | sed 's/ $//')"
+SERVICE_LINKS="$(awk '$1 == "link" {print $2}' "$SERVICES_SPEC" | tr '\n' ' ' | sed 's/ $//')"
 
 kernel="" rootfs="" out="" tools="" base_version="" force_preinit=0
 while [ $# -gt 0 ]; do
@@ -107,7 +107,7 @@ fi
 say "Applying the K2-OpenHost changes"
 cat > "$work/apply.sh" <<'APPLY'
 set -euo pipefail
-root="$1" src="$2" disabled="$3" release="$4"
+root="$1" src="$2" spec="$3" release="$4"
 (cd "$src" && tar -cf - --exclude=__pycache__ --exclude='*.pyc' .) | (cd "$root" && tar -xf -)
 (cd "$src" && find . -name __pycache__ -prune -o -type f ! -name '*.pyc' -print) | while read -r f; do
 	chown 0:0 "$root/$f"
@@ -116,21 +116,13 @@ root="$1" src="$2" disabled="$3" release="$4"
 	*) chmod 0644 "$root/$f" ;;
 	esac
 done
-for svc in $disabled; do
-	rm -f "$root"/etc/rc.d/[SK][0-9][0-9]"${svc#S99}"
-done
-# Wi-Fi after network (S20); after board_init (S20): k2oh-mcu (power cycle,
-# stock mcu_update, then the bridges) and the gadget; first-boot setup last.
-# The bridges have no S link: k2oh-mcu starts them once the boards are up.
-ln -sf ../init.d/k2oh-wifi "$root/etc/rc.d/S22k2oh-wifi"
-ln -sf ../init.d/k2oh-wifi "$root/etc/rc.d/K89k2oh-wifi"
-ln -sf ../init.d/k2oh-gadget "$root/etc/rc.d/S55k2oh-gadget"
-ln -sf ../init.d/k2oh-gadget "$root/etc/rc.d/K11k2oh-gadget"
-ln -sf ../init.d/k2oh-mcu "$root/etc/rc.d/S54k2oh-mcu"
-ln -sf ../init.d/k2oh-bridge "$root/etc/rc.d/K10k2oh-bridge"
-ln -sf ../init.d/k2oh-ctl "$root/etc/rc.d/S57k2oh-ctl"
-ln -sf ../init.d/k2oh-ctl "$root/etc/rc.d/K09k2oh-ctl"
-ln -sf ../init.d/k2oh-firstboot "$root/etc/rc.d/S99k2oh-firstboot"
+# Boot links from rootfs-services.txt (see the comments there).
+while read -r verb first second; do
+	case "$verb" in
+	disable) rm -f "$root"/etc/rc.d/[SK][0-9][0-9]"$first" ;;
+	link) ln -sf "../init.d/$second" "$root/etc/rc.d/$first" ;;
+	esac
+done < "$spec"
 # rootfs_data belongs to slot A: do not let block-mount attach it to /overlay.
 # block-mount must not run e2fsck on UDISK either.
 awk -v q="'" '
@@ -162,10 +154,10 @@ APPLY
 release="$(printf 'version=%s\nbuilt=%s\nbase_version=%s\nbase_tested=%s\nbase_kernel_md5=%s\nbase_rootfs_md5=%s' \
 	"$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${base_version:-unknown}" \
 	"$([ -n "$tested" ] && echo yes || echo no)" "$kernel_md5" "$rootfs_md5")"
-fakeroot -i "$state" -s "$state" bash "$work/apply.sh" "$root" "$HERE/rootfs" "$DISABLED_SERVICES" "$release"
+fakeroot -i "$state" -s "$state" bash "$work/apply.sh" "$root" "$HERE/rootfs" "$SERVICES_SPEC" "$release"
 
 say "Checking the result"
-for svc in klipper klipper_mcu moonraker nginx app adbd webrtc wipe_data swupdate_autorun mcu_update k2oh-bridge; do
+for svc in $DISABLED_SERVICES k2oh-bridge; do
 	# k2oh-bridge keeps its K link (stopped at shutdown), not an S link
 	if ls "$root"/etc/rc.d/ | grep -qx "S[0-9][0-9]$svc" \
 		|| { [ "$svc" != k2oh-bridge ] && ls "$root"/etc/rc.d/ | grep -qx "K[0-9][0-9]$svc"; }; then
@@ -175,7 +167,9 @@ done
 for bin in usr/sbin/wpa_supplicant sbin/udhcpc usr/bin/python3 usr/bin/mcu_util usr/bin/mcu_util_485 usr/bin/mcu_reset.sh; do
 	[ -e "$root/$bin" ] || [ -L "$root/$bin" ] || { echo "the stock rootfs has no /$bin" >&2; exit 1; }
 done
-[ -L "$root/etc/rc.d/S54k2oh-mcu" ] || { echo "k2oh-mcu is not enabled" >&2; exit 1; }
+for link in $SERVICE_LINKS; do
+	[ -L "$root/etc/rc.d/$link" ] || { echo "boot link $link is missing" >&2; exit 1; }
+done
 if grep -q boot_ver "$root/usr/share/klipper/fw/cfs/version.json" 2>/dev/null; then
 	echo "fw/cfs/version.json still lists CFS firmware: every boot would flash the CFS" >&2; exit 1
 fi

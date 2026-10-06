@@ -1,0 +1,37 @@
+# Boot links of slot B, read by build-slot-b.sh and update-slot-b.sh.
+#
+#   disable NAME        remove /etc/rc.d/[SK]??NAME: a stock service that does
+#                       not run in slot B
+#   link LINK NAME      /etc/rc.d/LINK -> ../init.d/NAME
+#
+# Any other /etc/rc.d/[SK]??k2oh-* link is removed by update-slot-b.sh.
+
+# Creality's own host stack: Klipper, Moonraker and nginx run on the external host.
+disable klipper
+disable klipper_mcu
+disable moonraker
+disable nginx
+# UI/cloud apps, ADB (it would take the USB controller), WebRTC camera.
+disable app
+disable adbd
+disable webrtc
+# Factory reset (it deletes most of UDISK) and USB-stick OTA (an OTA from slot
+# B would overwrite slot A).
+disable wipe_data
+disable swupdate_autorun
+# k2oh-mcu runs mcu_update after a power cycle and before the bridges: procd
+# ran it in parallel with the bridges on the first boot.
+disable mcu_update
+
+# Wi-Fi after network (S20); after board_init (S20): k2oh-mcu (power cycle,
+# stock mcu_update, then the bridges) and the gadget; first-boot setup last.
+# The bridges have no S link: k2oh-mcu starts them once the boards are up.
+link S22k2oh-wifi k2oh-wifi
+link K89k2oh-wifi k2oh-wifi
+link S54k2oh-mcu k2oh-mcu
+link S55k2oh-gadget k2oh-gadget
+link K11k2oh-gadget k2oh-gadget
+link K10k2oh-bridge k2oh-bridge
+link S57k2oh-ctl k2oh-ctl
+link K09k2oh-ctl k2oh-ctl
+link S99k2oh-firstboot k2oh-firstboot

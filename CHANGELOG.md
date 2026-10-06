@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3
+
+- **Programs updated without reinstalling.** `update-slot-b.sh` (bundle from `make-update-bundle.sh`; installer helper `t113 update`) updates K2-OpenHost's programs and boot links on a running slot B, in its writable layer: `--check` first, backups in `backup/programs-<date>`, a record in `programs-update.list`, `--revert` back to the image. A reinstall from slot A meant slot A reflashing its own release's files onto the boards. Kernel, `lib/preinit` and Creality base changes still need a reinstall, and `--check` says so.
+- `rootfs-services.txt`: the boot links (disabled stock services, K2-OpenHost's links) in one file, read by `build-slot-b.sh` and `update-slot-b.sh`.
+- `install-slot-b.sh` also drops the boot links and the version note of a program update; `k2oh-slot status` shows the programs version.
+
 ## 0.1.2
 
 Fixes from the first MCU firmware updates on the reference printer (2026-10-06):
