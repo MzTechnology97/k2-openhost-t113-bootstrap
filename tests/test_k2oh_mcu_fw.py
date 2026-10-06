@@ -618,5 +618,3 @@ def test_replace_set_from_a_held_image_keeps_its_held_list(apply_env):
     d = state["tmp_path"] / "fw" / "cfs"
     assert entries(d / "version.json") == []
     assert entries(d / "version.json.k2oh") == REAL_LIST["CFSs"]
-
-[executed on device: K2-OpenHost (89cb063b-3b3d-4426-afdd-42400b8c7ae2)]
