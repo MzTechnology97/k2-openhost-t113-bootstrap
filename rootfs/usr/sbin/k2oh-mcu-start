@@ -1,0 +1,43 @@
+#!/bin/sh
+# K2-OpenHost slot B: start the K2 boards at boot, then the bridges.
+#
+# Slot A runs Creality's /etc/init.d/mcu_update (S13) at boot. In slot B it is
+# not linked in rc.d, because on the first boot on a printer procd ran it while
+# the bridges (S56) were already reading the same UARTs: the bridges took
+# mcu_util's answers, the handshake failed and the boards stayed in Creality's
+# loader. After a reboot of the T113 alone the MCU rail also stays on, and the
+# boards keep the configuration of the previous host session, which Klipper
+# cannot reset.
+#
+# So, one step after the other:
+#   1. power-cycle the MCU rail (stock mcu_reset.sh): every board starts from
+#      its loader, as after a power-on;
+#   2. run the stock mcu_update: it starts every board and reflashes any whose
+#      version differs from slot B's firmware files;
+#   3. start the bridges.
+# /tmp/k2oh-mcu.ready holds mcu_update's exit code once step 2 is over.
+
+READY=/tmp/k2oh-mcu.ready
+
+log() {
+	logger -t k2oh-mcu "$*"
+	echo "k2oh-mcu: $*"
+}
+
+rm -f "$READY"
+if [ -x /usr/bin/mcu_reset.sh ]; then
+	log "power-cycling the MCU rail"
+	/usr/bin/mcu_reset.sh || log "mcu_reset.sh failed (exit $?)"
+	sleep 1
+else
+	log "no /usr/bin/mcu_reset.sh: the MCU rail is not cycled"
+fi
+
+log "running the stock mcu_update (it can take minutes when it flashes)"
+/etc/init.d/mcu_update start
+rc=$?
+log "mcu_update exit $rc, versions: $(tr -d '\n' < /tmp/.mcu_version 2>/dev/null)"
+echo "$rc" > "$READY"
+
+log "starting the bridges"
+/etc/init.d/k2oh-bridge start || log "the bridges did not start (exit $?)"

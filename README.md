@@ -7,7 +7,7 @@
 > In OpenHost mode the **nozzle and chamber cameras** cannot be managed by the T113 and must be rewired directly to the external Linux host, and the printer's **external USB port** cannot be used to print and stops working completely in gadget mode.
 > Read the [disclaimer and hardware limitations](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/en/DISCLAIMER.md) before using this.
 
-> **Status: built and tested offline, not yet booted on a printer.** Every piece below was checked on the reference CM5 (builds, file-by-file comparisons, the printer's own ARM binaries and Python in a chroot, real downloads from Creality and GitHub). Writing slot B, booting it and flashing MCUs have not run on hardware yet.
+> **Status: first boot on the reference printer on 2026-10-06 (0.1.0, trial boot, not kept).** Writing slot B, the trial boot, the gadget, the bridges, `k2oh-ctl` and HelixScreen worked. The boards did not start by themselves and five other problems showed up; all are fixed in 0.1.1 (see the [changelog](CHANGELOG.md)), which is not yet validated on hardware. Flashing MCUs has not run on hardware yet.
 
 > [!IMPORTANT]
 > **Firmware version.** This work was prepared and tested on the K2 Pro stock firmware **1.1.0.94**, the version on the reference printer. Newer Creality releases are accepted: slot B is built from them only when the boot scripts it changes are identical to the reviewed ones (true for 1.1.7.0), and the installer warns and asks for confirmation. **On any firmware other than 1.1.0.94, the correct operation of the bootstrap and of the T113 USB gadget (OTG) mode is not guaranteed.**
@@ -115,7 +115,7 @@ external host (helper.sh)                              printer T113, running slo
 9. The files are **uploaded** to `/mnt/UDISK/k2oh-slotb` on the printer and checked by SHA-256.
 10. `install-slot-b.sh --check` runs on the printer: nothing is written yet.
 11. **Confirm** to write slot B. The printer saves the U-Boot environment and the old slot B to `/mnt/UDISK/.k2openhost/backup/<date>/`, writes `bootB` and `rootfsB`, reads them back, and prepares slot B's writable layer:
-    - slot A's SSH `authorized_keys` and saved Wi-Fi networks are copied;
+    - slot A's SSH `authorized_keys`, SSH host keys (the printer keeps the same identity in both slots) and saved Wi-Fi networks are copied;
     - the host IP is saved in `/mnt/UDISK/.k2openhost/k2openhost.conf`;
     - the HelixScreen archive is kept for the first boot.
 12. Slot A still boots by default. Continue with the trial boot below.
@@ -144,10 +144,10 @@ After the trial boot:
 
 | Part | Detail |
 | --- | --- |
-| `k2oh-gadget` | Puts USB0 in device mode and creates three Generic Serial functions (`0525:a4a6`, interfaces 00/01/02), as the host udev rules expect. |
+| `k2oh-gadget` | Puts USB0 in device mode and creates three Generic Serial functions (`0525:a4a6`, interfaces 00/01/02), as the host udev rules expect. It names itself `Creality K2 Pro` / `K2-OpenHost Gadget Serial` with the printer serial number, so its `/dev/serial/by-id` names differ from those of slot A's stock gadget (`usb-Allwinner_Technology_Inc._Gadget_Serial-…`). On the host, use the udev names `/dev/k2-main`, `/dev/k2-nozzle` and `/dev/k2-rs485`: they are the same in both slots. |
 | `k2oh-bridge` | One bridge process per bus: `ttyGS0↔ttyS2` Main MCU, `ttyGS1↔ttyS3` Nozzle MCU, `ttyGS2↔ttyS5` RS-485/CFS/motors, 230400 8N1. Each direction has its own non-blocking queue, so a stalled side never stops the other. It waits for missing ports instead of exiting, and reopens the gadget port after a USB reconnect (the old descriptor only returns EOF). After a crash procd restarts it in 1 s, before Klipper gives up on its MCU (about 5 s). Counters go to `/tmp/k2oh-bridge/`. Options in `k2openhost.conf` as `BRIDGE_OPTS="..."` (`--chunk`, `--nice`, `--rr`, `--cpu`); the default is none, chosen from the [benchmarks](https://github.com/MzTechnology97/K2-OpenHost/blob/main/docs/en/USB_BRIDGE.md). |
 | `k2oh-linkstat` | Optional sampler for long prints: CPU, interrupts, UART error deltas, gadget state and bridge counters every 10 s to a CSV in RAM. Start it by hand: `k2oh-linkstat --out /tmp/k2oh-linkstat.csv &`. |
-| `mcu_update` (stock) | Kept: at every boot it starts the Main and Nozzle MCU applications (they power up in Creality's loader). It also reflashes any board whose version differs from slot B's firmware files. |
+| `k2oh-mcu` (S54) | At every boot, one step after the other: it power-cycles the MCU rail (stock `mcu_reset.sh`), runs Creality's `mcu_update`, then starts the bridges. `mcu_update` starts every board from its loader and reflashes any board whose version differs from slot B's firmware files. In slot B it has no boot link of its own: on the first boot procd ran it while the bridges already read the same UARTs, the handshake failed and the boards stayed in the loader. The power cycle also covers a reboot of the T113 alone, which leaves the boards running the previous host session. Log: `logread -e k2oh-mcu`, `/tmp/mcu_update.log`. |
 | `k2oh-ctl` | Control service for the external host: telemetry, MCU power rail, buzzer, bridges, HelixScreen. See [Control service](#control-service-k2oh-ctl). |
 | `k2oh-wifi` | Starts `wpa_supplicant` and `udhcpc` like Creality's `wifi-server` did, with the networks copied from slot A. Ethernet works as in stock. |
 | `k2oh-firstboot` / `k2oh-setup` | First boot: installs HelixScreen from the prepared archive and points it at `HOST_IP:7125`. Retried at each boot until it succeeds. `k2oh-setup --host <IP>` changes the host later (menu 29). |
@@ -388,7 +388,7 @@ What Creality's tools lack: they are closed binaries, they log less, and they re
 | Symptom | What to do |
 | --- | --- |
 | The printer does not come back after the trial boot | Power cycle it: it returns to slot A. Look at `/mnt/UDISK/.k2openhost/setup.log` from slot A. |
-| Klipper on the host does not connect | `./helper.sh doctor` checks the three channels. On the printer: `logread \| grep -E "k2oh\|bridge"`, `cat /sys/kernel/config/usb_gadget/g1/UDC`. |
+| Klipper on the host does not connect | `./helper.sh doctor` checks the three channels. On the printer: `logread \| grep -E "k2oh\|bridge"`, `cat /sys/kernel/config/usb_gadget/g1/UDC`. Empty versions in `/tmp/.mcu_version` mean the boards did not answer Creality's handshake: run `/etc/init.d/k2oh-bridge stop`, `mcu_reset.sh`, `/etc/init.d/mcu_update start` and `/etc/init.d/k2oh-bridge start`, then `FIRMWARE_RESTART`. If `printer.cfg` uses slot A's `usb-Allwinner_…` by-id names, switch to `/dev/k2-*` (installer helper: `config serial-names --udev`). |
 | `lsusb` shows `0525:a4a6 Linux-USB Serial Gadget` but no `/dev/ttyUSB0..2` exist | The host kernel saw the T113 gadget but did not bind Linux's generic `usbserial` driver. Run `sudo sh ~/k2-openhost-t113-bootstrap/host/k2oh-host-usbserial install`. It persists `vendor=0x0525 product=0xa4a6` in modprobe/modules-load configuration and binds a live gadget without unloading other serial devices. |
 | The screen stays on the boot logo | `k2oh-setup status`, `cat /mnt/UDISK/.k2openhost/setup.log`; run `k2oh-setup` again. |
 | HelixScreen cannot reach Moonraker | Wrong host IP: menu 29 or `k2oh-setup --host <IP>`. Check that the printer reaches the host on port 7125. |
@@ -451,4 +451,5 @@ python3 fetch-stock-ota.py 1.1.0.94 stock         # or "latest"
 | CFS plan with simulated units | exact variant chosen, up-to-date, invalid and unknown units skipped |
 | `k2oh-setup` with the real HelixScreen installer (chroot) | HelixScreen installed, Moonraker host set; service start needs the real system |
 | Model check (K2 Pro `F012`, board `CR0CN200400C10`) | read from the reference printer, read-only |
-| Writing slot B, trial boot, flashing | **not run on hardware yet** |
+| Writing slot B and trial boot (0.1.0, reference printer, 2026-10-06) | Slot B written and read back; slot A's environment and the old slot B backed up. The trial boot came up on slot B and pointed the next boot back at slot A. Gadget, bridges, `k2oh-ctl` (telemetry, power device) and HelixScreen worked with the host. Found: the boards did not start (the bridges raced `mcu_update`), a different SSH host key, by-id names different from slot A's, HelixScreen saw 0 MB free (long overlay name), a 120 s HelixScreen wait. All fixed in 0.1.1, not yet booted. |
+| Flashing | **not run on hardware yet** |
