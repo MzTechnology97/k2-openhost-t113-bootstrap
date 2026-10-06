@@ -11,6 +11,9 @@
     k2oh-mcu-fw stage VERSION         install a downloaded set in slot B
     k2oh-mcu-fw unstage               go back to slot B's original files
     k2oh-mcu-fw apply [--cfs]         flash now with the stock Creality tools
+    k2oh-mcu-fw apply --cfs --cfs-image FILE --cfs-sha256 SHA256
+                                      flash an explicitly verified same-version
+                                      CFS image through Creality's stock updater
 
 apply and update flash only when Moonraker on the external host reports
 Klippy disconnected AND --host-evidence carries a fresh proof from the host
@@ -750,43 +753,139 @@ def host_blockers(evidence_text, moonraker_url=None, now=None):
 
 
 UUID_RE = re.compile(r"^(?:[0-9a-f]{2} ){11}[0-9a-f]{2}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CUSTOM_CFS_RE = re.compile(
+    r"^(?P<boot>cfs[0-9]+_[0-9]+_G[0-9]+)-(?P<app>cfs[0-9]+_[0-9]+_[0-9]+)(?:-[A-Za-z0-9_.-]+)?\.bin$"
+)
 CFS_JSON = "/tmp/cfs_update.json"
 RS485_VERSIONS = "/tmp/.485_mcu_version"
 
 
-def cfs_plan():
+def prepare_custom_cfs(args):
+    """Validate and stage an explicit custom CFS image without flashing it.
+
+    The filename must encode both the exact boot/hardware token and the stock
+    application generation it was built from. The caller must provide the
+    expected SHA-256 independently; the staged copy is re-hashed before use.
+    """
+    image = getattr(args, "cfs_image", None)
+    expected = str(getattr(args, "cfs_sha256", "") or "").strip().lower()
+    wanted_uuid = str(getattr(args, "cfs_uuid", "") or "").strip().lower()
+    if not image and not expected and not wanted_uuid:
+        return None
+    if not getattr(args, "cfs", False):
+        die("--cfs-image requires --cfs")
+    if not image or not expected:
+        die("custom CFS flashing requires both --cfs-image and --cfs-sha256")
+    if not SHA256_RE.match(expected):
+        die("--cfs-sha256 must be exactly 64 lowercase/uppercase hexadecimal characters")
+    if wanted_uuid and not UUID_RE.match(wanted_uuid):
+        die("--cfs-uuid must be 12 lowercase/uppercase hex bytes separated by spaces")
+    source = os.path.abspath(image)
+    if not os.path.isfile(source):
+        die("custom CFS image does not exist: %s" % source)
+    match = CUSTOM_CFS_RE.match(os.path.basename(source))
+    if not match:
+        die("custom CFS filename must encode <boot>-<application>, e.g. "
+            "cfs0_050_G32-cfs0_000_153-rfid-diag-ro.bin")
+    actual = sha256_file(source)
+    if actual != expected:
+        die("custom CFS SHA-256 mismatch: expected %s, got %s" % (expected, actual))
+
+    custom_dir = os.path.join(LIBRARY, "custom-cfs")
+    os.makedirs(custom_dir, mode=0o700, exist_ok=True)
+    staged = os.path.join(custom_dir, "%s-%s.bin" % (match.group("boot"), expected))
+    tmp = staged + ".tmp-%d" % os.getpid()
+    try:
+        shutil.copyfile(source, tmp)
+        if sha256_file(tmp) != expected:
+            die("custom CFS staged-copy SHA-256 mismatch")
+        os.chmod(tmp, 0o400)
+        os.replace(tmp, staged)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    if sha256_file(staged) != expected:
+        die("custom CFS staged image changed after installation")
+    return {
+        "source": source,
+        "fw": staged,
+        "sha256": expected,
+        "boot": match.group("boot"),
+        "app": match.group("app"),
+        "uuid": wanted_uuid or None,
+    }
+
+
+def verify_custom_cfs(spec):
+    if not spec:
+        return
+    actual = sha256_file(spec["fw"])
+    if actual != spec["sha256"]:
+        raise StepError("custom CFS staged image SHA-256 changed: expected %s, got %s"
+                        % (spec["sha256"], actual))
+
+
+def cfs_plan(custom=None):
     """CFS units to flash, from the stock tool's own discovery output.
 
-    mcu_util_485 writes each unit it found in loader mode to
-    /tmp/.485_mcu_version with its UniID ("uuid", 12 bytes as lowercase hex
-    separated by spaces) and its loader identity ("version",
-    <boot>-<application>, e.g. cfs0_050_G32-cfs0_000_113). The file is picked
-    by the exact boot/hardware token, never guessed.
+    In normal mode, choose the unique firmware file matching each boot/hardware
+    token and skip units whose target version already matches.
+
+    In custom mode, do not infer anything: require the discovered boot token
+    and current stock application token to match the custom image filename. A
+    specific UUID may be supplied; otherwise exactly one matching unit must be
+    present. Same-version custom images are intentionally allowed here because
+    mcu_util_485 is still the component that performs the actual flash.
     """
     try:
         with open(RS485_VERSIONS) as f:
             units = json.load(f).get("CFSs") or []
     except (OSError, ValueError):
         units = []
-    plan, notes = [], []
-    cfs_dir = os.path.join(FW_ROOT, "cfs")
+
+    valid, notes = [], []
     for unit in units:
         uuid_text = str(unit.get("uuid", "")).strip().lower()
         version = str(unit.get("version", ""))
-        boot, _, app = version.partition("-")
-        if not UUID_RE.match(uuid_text) or not boot:
+        boot, sep, app = version.partition("-")
+        if not UUID_RE.match(uuid_text) or not sep or not boot or not app:
             notes.append("skipped a CFS with unreadable identity (%r)" % version)
             continue
-        files = sorted(n for n in os.listdir(cfs_dir) if n.startswith(boot + "-") and n.endswith(".bin"))             if os.path.isdir(cfs_dir) else []
+        valid.append({"uuid": uuid_text, "version": version, "boot": boot, "app": app})
+
+    if custom:
+        matches = [u for u in valid
+                   if u["boot"] == custom["boot"] and u["app"] == custom["app"]
+                   and (not custom.get("uuid") or u["uuid"] == custom["uuid"])]
+        if not matches:
+            wanted = "%s-%s" % (custom["boot"], custom["app"])
+            suffix = " UUID %s" % custom["uuid"] if custom.get("uuid") else ""
+            raise StepError("stock discovery found no CFS matching %s%s" % (wanted, suffix))
+        if len(matches) != 1:
+            raise StepError("stock discovery found %d CFS units matching %s-%s; "
+                            "use --cfs-uuid to select exactly one"
+                            % (len(matches), custom["boot"], custom["app"]))
+        unit = matches[0]
+        return [{"uuid": unit["uuid"], "fw": custom["fw"],
+                 "from": unit["version"], "to": "custom:%s" % os.path.basename(custom["source"]) }], notes
+
+    plan = []
+    cfs_dir = os.path.join(FW_ROOT, "cfs")
+    for unit in valid:
+        files = sorted(n for n in os.listdir(cfs_dir)
+                       if n.startswith(unit["boot"] + "-") and n.endswith(".bin")) \
+                if os.path.isdir(cfs_dir) else []
         if len(files) != 1:
-            notes.append("CFS %s: %d files for %s, not flashed" % (version, len(files), boot))
+            notes.append("CFS %s: %d files for %s, not flashed"
+                         % (unit["version"], len(files), unit["boot"]))
             continue
         target = files[0][:-4]
-        if target == version:
-            notes.append("CFS %s is up to date" % version)
+        if target == unit["version"]:
+            notes.append("CFS %s is up to date" % unit["version"])
             continue
-        plan.append({"uuid": uuid_text, "fw": os.path.join(cfs_dir, files[0]),
-                     "from": version, "to": target})
+        plan.append({"uuid": unit["uuid"], "fw": os.path.join(cfs_dir, files[0]),
+                     "from": unit["version"], "to": target})
     return plan, notes
 
 
@@ -823,7 +922,17 @@ def run_mcu_update(cfs=False):
 def cmd_apply(args):
     require_slot_b()
     model = model_dir()
+    custom_cfs = prepare_custom_cfs(args)
     reasons, notes = host_blockers(args.host_evidence, args.moonraker)
+    if custom_cfs:
+        pending_non_cfs = [
+            "%s %s %s" % (role, version, state)
+            for role, version, state, target in board_plan(model)
+            if target and target != version and not role.startswith("cfs@")
+        ]
+        if pending_non_cfs:
+            reasons.append("custom CFS flash refused while non-CFS boards differ from slot-B files: "
+                           + "; ".join(pending_non_cfs))
     for note in notes:
         print(note)
     if reasons:
@@ -834,7 +943,14 @@ def cmd_apply(args):
     print("external host: Klipper stopped and this printer's ports free")
     print("This power-cycles the printer's MCUs and flashes every board whose version differs")
     print("from the files in %s (%s)." % (FW_ROOT, read_staged() or "slot B original"))
-    if args.cfs:
+    if custom_cfs:
+        print("Custom CFS image: %s" % custom_cfs["source"])
+        print("  SHA-256: %s" % custom_cfs["sha256"])
+        print("  required stock identity: %s-%s" % (custom_cfs["boot"], custom_cfs["app"]))
+        if custom_cfs.get("uuid"):
+            print("  required CFS UUID: %s" % custom_cfs["uuid"])
+        print("The actual CFS write is still performed only by Creality's stock mcu_util_485.")
+    elif args.cfs:
         print("With --cfs, a second pass flashes the CFS units the stock tool reports, using")
         print("the file that matches each unit's exact boot/hardware token.")
     else:
@@ -851,12 +967,14 @@ def cmd_apply(args):
             os.unlink(CFS_JSON)
         run_mcu_update()
         if args.cfs:
-            plan, cfs_notes = cfs_plan()
+            verify_custom_cfs(custom_cfs)
+            plan, cfs_notes = cfs_plan(custom_cfs)
             for note in cfs_notes:
                 print("  " + note)
             if plan:
                 for item in plan:
                     print("  CFS %s -> %s" % (item["from"], item["to"]))
+                verify_custom_cfs(custom_cfs)
                 with open(CFS_JSON, "w") as f:
                     json.dump({"CFSs": [{"uuid": i["uuid"], "fw": i["fw"]} for i in plan]}, f)
                 run_mcu_update(cfs=True)
@@ -929,14 +1047,25 @@ def main():
     p = sub.add_parser("stage")
     p.add_argument("version")
     sub.add_parser("unstage")
-    for name in ("apply", "update"):
-        p = sub.add_parser(name)
+    def add_flash_args(p):
         p.add_argument("--host-evidence", metavar="PROOF",
                        help="output of 'sudo k2oh-host-evidence' on the external host")
         p.add_argument("--yes", action="store_true",
                        help="do not ask for confirmation (the host checks still apply)")
         p.add_argument("--moonraker", metavar="URL", help="external host Moonraker, e.g. http://10.10.1.97:7125")
         p.add_argument("--cfs", action="store_true", help="also flash the CFS units (second pass)")
+
+    p = sub.add_parser("apply")
+    add_flash_args(p)
+    p.add_argument("--cfs-image", metavar="FILE",
+                   help="explicit custom CFS image; still flashed only by Creality's stock updater")
+    p.add_argument("--cfs-sha256", metavar="SHA256",
+                   help="required SHA-256 for --cfs-image")
+    p.add_argument("--cfs-uuid", metavar="UUID",
+                   help="optional exact 12-byte CFS UniID; required when discovery is ambiguous")
+
+    p = sub.add_parser("update")
+    add_flash_args(p)
     args = parser.parse_args()
     if os.geteuid() != 0 and args.cmd in ("download", "stage", "unstage", "apply", "update"):
         die("run as root")
