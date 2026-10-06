@@ -147,8 +147,8 @@ Slot B's system is a read-only image in `rootfsB`, which can only be written fro
 
 | Action | Menu | Command |
 | --- | --- | --- |
-| Update the programs | 32 | `./helper.sh t113 update` |
-| Back to the image's programs | 32 | `./helper.sh t113 update --revert` |
+| Update the programs | 33 | `./helper.sh t113 update` |
+| Back to the image's programs | 33 | `./helper.sh t113 update --revert` |
 
 1. `make-update-bundle.sh` packs `/etc/init.d/k2oh-*`, `/usr/bin/k2oh-*`, `/usr/sbin/k2oh-*`, `chamber_cam_power.sh`, the boot links of `rootfs-services.txt` and `VERSION`, with SHA-256 sums.
 2. On the printer, `update-slot-b.sh --check` lists the changed programs and boot links, and says whether they take effect now or at the next reboot. It writes nothing.
