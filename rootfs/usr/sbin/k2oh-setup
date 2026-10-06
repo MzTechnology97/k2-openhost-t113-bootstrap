@@ -21,6 +21,7 @@ B runs this automatically (/etc/init.d/k2oh-firstboot).
 import ipaddress
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -124,10 +125,59 @@ def point_helix(host, port):
         changed = True
     changed = point_helix_wait(host, port) or changed
     if changed and os.path.exists(HELIX_INIT):
-        subprocess.run([HELIX_INIT, "restart"], stdin=subprocess.DEVNULL)
+        restart_helix()
     elif not changed:
         log("HelixScreen settings not found yet; it will ask for the host in its setup wizard")
     return changed
+
+
+HELIX_BIN = "/opt/helixscreen/bin/"
+HELIX_PROCESSES = ("helix-launcher.sh", "helix-watchdog", "helix-screen", "helix-splash")
+
+
+def helix_pids(proc="/proc"):
+    """PIDs of HelixScreen's launcher, watchdog, UI and splash."""
+    names = {HELIX_BIN + name for name in HELIX_PROCESSES}
+    pids = []
+    for entry in os.listdir(proc):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open(os.path.join(proc, entry, "cmdline"), "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        # the launcher is "/bin/sh /opt/helixscreen/bin/helix-launcher.sh"
+        if any(arg.decode("utf-8", "replace") in names for arg in argv[:2]):
+            pids.append(int(entry))
+    return pids
+
+
+def restart_helix(proc="/proc", wait=5.0):
+    """Stop HelixScreen, end whatever the stop left, start it again.
+
+    On the first boot S99helixscreen and k2oh-firstboot start together, and a
+    plain "restart" while HelixScreen was still starting left its first
+    launcher running: two watchdogs then fought over one screen ("Another
+    instance of helix-screen is already running").
+    """
+    subprocess.run([HELIX_INIT, "stop"], stdin=subprocess.DEVNULL)
+    pids = helix_pids(proc)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        deadline = time.monotonic() + wait
+        while pids and time.monotonic() < deadline:
+            time.sleep(0.2)
+            pids = [pid for pid in pids if os.path.exists(os.path.join(proc, str(pid)))]
+        if not pids:
+            break
+    if pids:
+        log("HelixScreen processes still running after SIGKILL: %s" % pids)
+    subprocess.run([HELIX_INIT, "start"], stdin=subprocess.DEVNULL)
 
 
 WAIT_MARK = "# k2oh-setup: Moonraker runs on the external host"
