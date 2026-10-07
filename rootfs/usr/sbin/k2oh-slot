@@ -54,6 +54,10 @@ cmd_status() {
 	if [ -f /etc/k2openhost-release ]; then
 		echo "Running     : K2-OpenHost slot B"
 		sed 's/^/  /' /etc/k2openhost-release
+		if [ -f /etc/k2openhost-programs ]; then
+			echo "Programs    : updated without reinstalling (update-slot-b.sh)"
+			sed 's/^/  /' /etc/k2openhost-programs
+		fi
 	else
 		echo "Running     : stock system ($(cat /etc/openwrt_version 2>/dev/null))"
 	fi

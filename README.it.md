@@ -35,13 +35,14 @@ Va nello **slot B**. Lo **slot A**, il sistema che la stampante usa oggi, non vi
 2. [Requisiti](#requisiti)
 3. [Installazione passo per passo](#installazione-passo-per-passo)
 4. [Avvio di prova, conferma, ritorno](#avvio-di-prova-conferma-ritorno)
-5. [Cosa gira nello slot B](#cosa-gira-nello-slot-b)
-6. [Servizio di controllo (k2oh-ctl)](#servizio-di-controllo-k2oh-ctl)
-7. [Aggiornare il firmware di MCU, motori e CFS](#aggiornare-il-firmware-di-mcu-motori-e-cfs)
-8. [Perché lo strumento Creality e non quello di Jacob](#perché-lo-strumento-creality-e-non-quello-di-jacob)
-9. [Risoluzione dei problemi](#risoluzione-dei-problemi)
-10. [Rimozione](#rimozione)
-11. [Riferimento](#riferimento)
+5. [Aggiornare i programmi senza reinstallare](#aggiornare-i-programmi-senza-reinstallare)
+6. [Cosa gira nello slot B](#cosa-gira-nello-slot-b)
+7. [Servizio di controllo (k2oh-ctl)](#servizio-di-controllo-k2oh-ctl)
+8. [Aggiornare il firmware di MCU, motori e CFS](#aggiornare-il-firmware-di-mcu-motori-e-cfs)
+9. [Perché lo strumento Creality e non quello di Jacob](#perché-lo-strumento-creality-e-non-quello-di-jacob)
+10. [Risoluzione dei problemi](#risoluzione-dei-problemi)
+11. [Rimozione](#rimozione)
+12. [Riferimento](#riferimento)
 
 ## Come funziona
 
@@ -148,6 +149,24 @@ Dopo l'avvio di prova:
 2. Controlla che Klipper sull'host si colleghi (Mainsail mostra la stampante pronta). L'host aspetta fino a 60 s i tre canali gadget.
 3. Controlla lo schermo: al primo avvio viene installato HelixScreen (circa un minuto), già puntato sul tuo host.
 4. Esegui **27) Keep slot B**.
+
+## Aggiornare i programmi senza reinstallare
+
+Il sistema dello slot B è un'immagine in sola lettura in `rootfsB`, che si può scrivere solo dallo slot A. Una reinstallazione passa quindi dallo slot A, che all'avvio riscrive sulle schede i file della sua versione. I programmi di K2-OpenHost invece si possono aggiornare sullo slot B in uso:
+
+| Azione | Menu | Comando |
+| --- | --- | --- |
+| Aggiornare i programmi | 33 | `./helper.sh t113 update` |
+| Tornare ai programmi dell'immagine | 33 | `./helper.sh t113 update --revert` |
+
+1. `make-update-bundle.sh` raccoglie `/etc/init.d/k2oh-*`, `/usr/bin/k2oh-*`, `/usr/sbin/k2oh-*`, `chamber_cam_power.sh`, i collegamenti di avvio di `rootfs-services.txt` e `VERSION`, con le somme SHA-256.
+2. Sulla stampante, `update-slot-b.sh --check` elenca i programmi e i collegamenti di avvio che cambiano, e dice se valgono subito o dal prossimo riavvio. Non scrive niente.
+3. L'aggiornamento salva i programmi attuali in `/mnt/UDISK/.k2openhost/backup/programs-<data>/`, installa quelli nuovi nel livello scrivibile dello slot B e li registra in `programs-update.list`. Riavvia `k2oh-ctl` e i bridge se sono cambiati; i programmi che lavorano solo all'avvio (`k2oh-mcu`, script di init) richiedono un riavvio, che l'helper propone.
+4. `k2oh-slot status` mostra la versione dei programmi accanto a quella dell'immagine.
+
+`--revert` rimette la versione dell'immagine di ogni programma e collegamento registrato. Una reinstallazione toglie da sola i programmi e i collegamenti aggiornati.
+
+Solo una reinstallazione cambia il kernel, `lib/preinit/80_mount_root` (lavora prima che esista il livello scrivibile) o la base Creality: `--check` li indica come "needs a reinstall".
 
 ## Cosa gira nello slot B
 
@@ -404,6 +423,9 @@ Cosa manca agli strumenti Creality: sono binari chiusi, registrano meno informaz
 | `build-slot-b.sh` | host | Costruisce `bootB.img` e `rootfsB.squashfs` da `kernel` e `rootfs` originali; avvisa sulle versioni diverse dalla 1.1.0.94 e si rifiuta se gli script di avvio originali che modifica sono diversi (`--force-preinit` per forzare dopo una verifica). |
 | `fetch-stock-ota.py` | host | Elenca le versioni Creality, ne scarica una (o l'ultima), verifica l'MD5, tiene `kernel` e `rootfs`. |
 | `install-slot-b.sh` | stampante, slot A | `--check` / scrittura dello slot B, backup, file di setup. |
+| `rootfs-services.txt` | — | Collegamenti di avvio dello slot B: servizi originali disattivati e quelli di K2-OpenHost. Letto da `build-slot-b.sh` e `update-slot-b.sh`. |
+| `make-update-bundle.sh` | host | Raccoglie i programmi di K2-OpenHost per `update-slot-b.sh`. |
+| `update-slot-b.sh` | stampante, slot B | `--check` / aggiornamento / `--revert` dei programmi di K2-OpenHost senza reinstallare. |
 | `rootfs/` | — | File aggiunti al filesystem originale. |
 | `host/k2oh-host-usbserial` | host | Rende persistente e attiva l'associazione del driver generico Linux `usbserial` richiesta dal gadget T113 `0525:a4a6` a tre canali `gser`. |
 | [`scripts/t113.sh`](https://github.com/MzTechnology97/k2-openhost-installer-helper/blob/main/scripts/t113.sh) (installer helper) | host | I comandi T113 dell'helper; clona questo repository in `~/k2-openhost-t113-bootstrap`. |
