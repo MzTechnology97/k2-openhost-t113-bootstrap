@@ -30,13 +30,14 @@ This turns the printer's T113 board into a ready K2-OpenHost bridge: USB gadget 
 2. [Requirements](#requirements)
 3. [Install, step by step](#install-step-by-step)
 4. [Trial boot, keep, go back](#trial-boot-keep-go-back)
-5. [What runs in slot B](#what-runs-in-slot-b)
-6. [Control service (k2oh-ctl)](#control-service-k2oh-ctl)
-7. [Updating MCU, motor and CFS firmware](#updating-mcu-motor-and-cfs-firmware)
-8. [Why Creality's updater and not Jacob's](#why-creality-s-updater-and-not-jacob-s)
-9. [Troubleshooting](#troubleshooting)
-10. [Removing it](#removing-it)
-11. [Reference](#reference)
+5. [Updating the programs without reinstalling](#updating-the-programs-without-reinstalling)
+6. [What runs in slot B](#what-runs-in-slot-b)
+7. [Control service (k2oh-ctl)](#control-service-k2oh-ctl)
+8. [Updating MCU, motor and CFS firmware](#updating-mcu-motor-and-cfs-firmware)
+9. [Why Creality's updater and not Jacob's](#why-creality-s-updater-and-not-jacob-s)
+10. [Troubleshooting](#troubleshooting)
+11. [Removing it](#removing-it)
+12. [Reference](#reference)
 
 ## How it works
 
@@ -139,6 +140,24 @@ After the trial boot:
 2. Check that Klipper on the host connects (Mainsail shows the printer ready). The host's start gate waits up to 60 s for the three gadget channels.
 3. Check the screen: the first boot installs HelixScreen (about a minute), already pointed at your host.
 4. Run **27) Keep slot B**.
+
+## Updating the programs without reinstalling
+
+Slot B's system is a read-only image in `rootfsB`, which can only be written from slot A. A reinstall therefore goes through slot A, and slot A flashes its own release's files back onto the boards at boot. K2-OpenHost's own programs can instead be updated on the running slot B:
+
+| Action | Menu | Command |
+| --- | --- | --- |
+| Update the programs | 33 | `./helper.sh t113 update` |
+| Back to the image's programs | 33 | `./helper.sh t113 update --revert` |
+
+1. `make-update-bundle.sh` packs `/etc/init.d/k2oh-*`, `/usr/bin/k2oh-*`, `/usr/sbin/k2oh-*`, `chamber_cam_power.sh`, the boot links of `rootfs-services.txt` and `VERSION`, with SHA-256 sums.
+2. On the printer, `update-slot-b.sh --check` lists the changed programs and boot links, and says whether they take effect now or at the next reboot. It writes nothing.
+3. The update saves the current programs to `/mnt/UDISK/.k2openhost/backup/programs-<date>/`, installs the new ones in slot B's writable layer and records them in `programs-update.list`. It restarts `k2oh-ctl` and the bridges when they changed; programs that only run at boot (`k2oh-mcu`, init scripts) need a reboot, which the helper offers.
+4. `k2oh-slot status` shows the programs version next to the image version.
+
+`--revert` puts back the image's version of every recorded program and boot link. A reinstall drops the updated programs and boot links by itself.
+
+Only a reinstall changes the kernel, `lib/preinit/80_mount_root` (it runs before the writable layer exists) or the Creality base: `--check` names those as "needs a reinstall".
 
 ## What runs in slot B
 
@@ -412,6 +431,9 @@ What Creality's tools lack: they are closed binaries, they log less, and they re
 | `build-slot-b.sh` | host | Builds `bootB.img` and `rootfsB.squashfs` from the stock `kernel` and `rootfs`; warns on releases other than 1.1.0.94 and refuses when the stock boot scripts it changes differ (`--force-preinit` to override after a review). |
 | `fetch-stock-ota.py` | host | Lists Creality's releases, downloads one (or the latest), checks MD5, keeps `kernel` and `rootfs`. |
 | `install-slot-b.sh` | printer, slot A | `--check` / write slot B, backups, setup files. |
+| `rootfs-services.txt` | — | Slot B's boot links: stock services turned off, K2-OpenHost's own. Read by `build-slot-b.sh` and `update-slot-b.sh`. |
+| `make-update-bundle.sh` | host | Packs K2-OpenHost's programs for `update-slot-b.sh`. |
+| `update-slot-b.sh` | printer, slot B | `--check` / update / `--revert` K2-OpenHost's programs without reinstalling. |
 | `rootfs/` | — | Files added to the stock root filesystem. |
 | `host/k2oh-host-usbserial` | host | Persists and activates the Linux generic `usbserial` binding required by the T113 `0525:a4a6` three-channel `gser` gadget. |
 | [`scripts/t113.sh`](https://github.com/MzTechnology97/k2-openhost-installer-helper/blob/main/scripts/t113.sh) (installer helper) | host | The helper's T113 commands; clones this repository to `~/k2-openhost-t113-bootstrap`. |

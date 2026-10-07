@@ -128,6 +128,18 @@ for f in "$upper"/etc/init.d/k2oh-* "$upper"/usr/bin/k2oh-* "$upper"/usr/sbin/k2
 	[ -e "$f" ] || [ -L "$f" ] || continue
 	rm -f "$f" && echo "  removed the old copy of /${f#"$upper"/} from the writable layer"
 done
+# Boot links and the version note left by update-slot-b.sh: the new image
+# brings its own.
+if [ -f "$K2OH_DIR/programs-update.list" ]; then
+	sort -u "$K2OH_DIR/programs-update.list" | while read -r path; do
+		case "$path" in
+		etc/rc.d/*) rm -f "$upper/$path" ;;
+		esac
+	done
+	rm -f "$K2OH_DIR/programs-update.list"
+	echo "  removed the boot links of the last program update"
+fi
+rm -f "$upper/etc/k2openhost-programs"
 if [ -s /etc/dropbear/authorized_keys ]; then
 	cp /etc/dropbear/authorized_keys "$upper/etc/dropbear/authorized_keys"
 	chmod 0600 "$upper/etc/dropbear/authorized_keys"

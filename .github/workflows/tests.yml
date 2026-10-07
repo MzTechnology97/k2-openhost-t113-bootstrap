@@ -14,4 +14,4 @@ jobs:
           python-version: "3.9"
       - run: pip install pytest
       - run: python -m pytest -q tests
-      - run: bash -n build-slot-b.sh install-slot-b.sh
+      - run: bash -n build-slot-b.sh install-slot-b.sh make-update-bundle.sh && sh -n update-slot-b.sh
