@@ -315,7 +315,7 @@ def make_custom_image(tmp_path, name="cfs0_050_G32-cfs0_000_153-rfid-diag-ro-v2_
     if data is None:
         image = bytearray(0x300)
         image[0:4] = (0x20001000).to_bytes(4, "little")
-        image[4:8] = (0x08010101).to_bytes(4, "little")
+        image[4:8] = (0x08003101).to_bytes(4, "little")
         image[0x200:0x20c] = b"cfs0_000_153"
         image[0x20c:0x212] = b"\x00" * 6
         crc = fw.creality_cfs_crc16(image)
@@ -347,6 +347,49 @@ def test_custom_cfs_container_rejects_bad_crc(apply_env):
     data[-1] ^= 0x01
     image.write_bytes(data)
     with pytest.raises(fw.StepError, match="CRC16 mismatch"):
+        fw.validate_custom_cfs_container(str(image), "cfs0_000_153")
+
+
+def build_container(size, reset_vector, app=b"cfs0_000_153"):
+    image = bytearray(size)
+    image[0:4] = (0x20006EE8).to_bytes(4, "little")
+    image[4:8] = reset_vector.to_bytes(4, "little")
+    image[0x200:0x20c] = app
+    image[0x20c:0x20e] = fw.creality_cfs_crc16(image).to_bytes(2, "little")
+    image[0x20e:0x212] = size.to_bytes(4, "little")
+    return bytes(image)
+
+
+@pytest.mark.parametrize("size,reset_vector", [
+    (0x2AE38, 0x0801A969),  # stock cfs0_000_153: size and reset vector of the real image
+    (0x8000, 0x08003401),   # a small image starting right after the loader
+    (fw.CFS_APP_MAX_SIZE, fw.CFS_PARAM_PAGE - 1),
+])
+def test_custom_cfs_container_accepts_images_linked_at_0x08003000(apply_env, size, reset_vector):
+    _calls, state = apply_env
+    image, _digest = make_custom_image(state["tmp_path"], data=build_container(size, reset_vector))
+    info = fw.validate_custom_cfs_container(str(image), "cfs0_000_153")
+    assert info["reset_vector"] == reset_vector
+
+
+@pytest.mark.parametrize("size,reset_vector", [
+    (0x8000, 0x08002F01),   # inside the loader
+    (0x8000, 0x0800B001),   # just past the end of the image
+    (0x2AE38, 0x08030001),  # inside the old 0x08010000-based window, outside the real image
+    (0x8000, 0x08003400),   # not a Thumb address
+])
+def test_custom_cfs_container_rejects_reset_vector_outside_image(apply_env, size, reset_vector):
+    _calls, state = apply_env
+    image, _digest = make_custom_image(state["tmp_path"], data=build_container(size, reset_vector))
+    with pytest.raises(fw.StepError, match="reset vector"):
+        fw.validate_custom_cfs_container(str(image), "cfs0_000_153")
+
+
+def test_custom_cfs_container_rejects_image_reaching_parameter_page(apply_env):
+    _calls, state = apply_env
+    size = fw.CFS_APP_MAX_SIZE + 4
+    image, _digest = make_custom_image(state["tmp_path"], data=build_container(size, 0x08003401))
+    with pytest.raises(fw.StepError, match="parameter page"):
         fw.validate_custom_cfs_container(str(image), "cfs0_000_153")
 
 
