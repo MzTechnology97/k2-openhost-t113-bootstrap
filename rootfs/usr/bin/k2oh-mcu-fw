@@ -809,7 +809,12 @@ CUSTOM_CFS_RE = re.compile(
 )
 CFS_JSON = "/tmp/cfs_update.json"
 RS485_VERSIONS = "/tmp/.485_mcu_version"
-CFS_APP_BASE = 0x08010000
+# The CFS loader (0x08000000..0x08002fff) writes every application image from
+# 0x08003000 upwards; the host never sends an address. Its last flash page,
+# 0x0807f800, holds the CFS parameters, so an image must end below it.
+CFS_APP_BASE = 0x08003000
+CFS_PARAM_PAGE = 0x0807F800
+CFS_APP_MAX_SIZE = CFS_PARAM_PAGE - CFS_APP_BASE
 CFS_APP_ID_OFFSET = 0x200
 CFS_APP_ID_SIZE = 12
 CFS_CRC_OFFSET = 0x20C
@@ -842,6 +847,9 @@ def validate_custom_cfs_container(path, expected_app):
         raise StepError("cannot read custom CFS image for container validation: %s" % exc)
     if len(data) < CFS_METADATA_END:
         raise StepError("custom CFS image is too short for Creality metadata")
+    if len(data) > CFS_APP_MAX_SIZE:
+        raise StepError("custom CFS image is 0x%x bytes; it must stay below the parameter page "
+                        "at 0x%08x (at most 0x%x bytes)" % (len(data), CFS_PARAM_PAGE, CFS_APP_MAX_SIZE))
     try:
         app_id = bytes(data[CFS_APP_ID_OFFSET:CFS_APP_ID_OFFSET + CFS_APP_ID_SIZE]).decode("ascii")
     except UnicodeDecodeError:
