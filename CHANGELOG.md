@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Custom CFS images are checked against the real application base, `0x08003000`.** The container check expected the reset vector inside `0x08010000 + size`, an analysis convention, not the address the CFS loader writes to: the loader writes every image from `0x08003000` and the host sends no address. Stock 150, 122 and 153 passed only because their reset vectors also fall in the wrong window; `cfs6_222_000` (reset `0x08004145`) and any small image were refused, and a reset vector past the end of the image could pass.
+- **A custom CFS image must end below the parameter page** at `0x0807f800`: at most `0x7c800` bytes. The loader itself does not check this.
+
 ## 0.1.3
 
 - **Programs updated without reinstalling.** `update-slot-b.sh` (bundle from `make-update-bundle.sh`; installer helper `t113 update`) updates K2-OpenHost's programs and boot links on a running slot B, in its writable layer: `--check` first, backups in `backup/programs-<date>`, a record in `programs-update.list`, `--revert` back to the image. A reinstall from slot A meant slot A reflashing its own release's files onto the boards. Kernel, `lib/preinit` and Creality base changes still need a reinstall, and `--check` says so.
