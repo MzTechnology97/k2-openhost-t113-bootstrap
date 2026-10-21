@@ -34,4 +34,6 @@ link K11k2oh-gadget k2oh-gadget
 link K10k2oh-bridge k2oh-bridge
 link S57k2oh-ctl k2oh-ctl
 link K09k2oh-ctl k2oh-ctl
+link S98k2oh-helix-filaments k2oh-helix-filaments
+link K08k2oh-helix-filaments k2oh-helix-filaments
 link S99k2oh-firstboot k2oh-firstboot

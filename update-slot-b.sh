@@ -87,6 +87,7 @@ note_effect() {
 	case "$1" in
 	usr/bin/k2oh-ctl|etc/init.d/k2oh-ctl) restart="$restart k2oh-ctl" ;;
 	usr/bin/k2oh-bridge|etc/init.d/k2oh-bridge) restart="$restart k2oh-bridge" ;;
+	usr/bin/k2oh-helix-filaments|etc/init.d/k2oh-helix-filaments) restart="$restart k2oh-helix-filaments" ;;
 	etc/init.d/k2oh-*|usr/sbin/k2oh-mcu-start|usr/bin/chamber_cam_power.sh) reboot=1 ;;
 	esac
 }
