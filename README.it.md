@@ -38,11 +38,12 @@ Va nello **slot B**. Lo **slot A**, il sistema che la stampante usa oggi, non vi
 5. [Aggiornare i programmi senza reinstallare](#aggiornare-i-programmi-senza-reinstallare)
 6. [Cosa gira nello slot B](#cosa-gira-nello-slot-b)
 7. [Servizio di controllo (k2oh-ctl)](#servizio-di-controllo-k2oh-ctl)
-8. [Aggiornare il firmware di MCU, motori e CFS](#aggiornare-il-firmware-di-mcu-motori-e-cfs)
-9. [Perché lo strumento Creality e non quello di Jacob](#perché-lo-strumento-creality-e-non-quello-di-jacob)
-10. [Risoluzione dei problemi](#risoluzione-dei-problemi)
-11. [Rimozione](#rimozione)
-12. [Riferimento](#riferimento)
+8. [Elenco filamenti di HelixScreen (k2oh-helix-filaments)](#elenco-filamenti-di-helixscreen-k2oh-helix-filaments)
+9. [Aggiornare il firmware di MCU, motori e CFS](#aggiornare-il-firmware-di-mcu-motori-e-cfs)
+10. [Perché lo strumento Creality e non quello di Jacob](#perché-lo-strumento-creality-e-non-quello-di-jacob)
+11. [Risoluzione dei problemi](#risoluzione-dei-problemi)
+12. [Rimozione](#rimozione)
+13. [Riferimento](#riferimento)
 
 ## Come funziona
 
@@ -177,6 +178,7 @@ Solo una reinstallazione cambia il kernel, `lib/preinit/80_mount_root` (lavora p
 | `k2oh-linkstat` | Campionatore opzionale per stampe lunghe: CPU, interrupt, differenze degli errori UART, stato del gadget e contatori dei bridge ogni 10 s in un CSV in RAM. Si avvia a mano: `k2oh-linkstat --out /tmp/k2oh-linkstat.csv &`. |
 | `k2oh-mcu` (S54) | A ogni avvio, un passo dopo l'altro: spegne e riaccende l'alimentazione delle MCU (`mcu_reset.sh` originale), esegue `mcu_update` di Creality, poi avvia i bridge. `mcu_update` avvia ogni scheda dal suo loader e riscrive ogni scheda la cui versione è diversa dai file firmware dello slot B. Nello slot B non ha un suo collegamento di avvio: al primo avvio procd lo ha eseguito mentre i bridge leggevano già gli stessi UART, l'handshake è fallito e le schede sono rimaste nel loader. Lo spegnimento copre anche il riavvio della sola T113, che lascia le schede con la sessione precedente dell'host. Log: `logread -e k2oh-mcu`, `/tmp/mcu_update.log`. |
 | `k2oh-ctl` | Servizio di controllo per l'host esterno: telemetria, alimentazione delle MCU, buzzer, bridge, HelixScreen. Vedi [Servizio di controllo](#servizio-di-controllo-k2oh-ctl). |
+| `k2oh-helix-filaments` (S98) | HelixScreen mostra solo la libreria filamenti dell'host (i filamenti CFS di sistema di Kalico più i tuoi), non i suoi preset. Vedi [Elenco filamenti di HelixScreen](#elenco-filamenti-di-helixscreen-k2oh-helix-filaments). |
 | `k2oh-wifi` | Avvia `wpa_supplicant` e `udhcpc` come faceva il `wifi-server` Creality, con le reti copiate dallo slot A. L'Ethernet funziona come nell'originale. |
 | `k2oh-firstboot` / `k2oh-setup` | Primo avvio: installa HelixScreen dall'archivio preparato e lo collega a `HOST_IP:7125`. Riprova a ogni avvio finché non riesce. `k2oh-setup --host <IP>` cambia l'host in seguito (menu 29). |
 | HelixScreen | L'interfaccia touch sullo schermo della stampante, collegata al Moonraker dell'host. |
@@ -222,6 +224,40 @@ Il lato host è `[k2_t113]` in [kalico-k2pro](https://github.com/MzTechnology97/
 - un arresto di emergenza seguito dalla riaccensione.
 
 Il resto dello slot B non è ancora stato avviato su una stampante.
+
+## Elenco filamenti di HelixScreen (k2oh-helix-filaments)
+
+HelixScreen include un suo catalogo di circa 360 preset. Nello slot B i selettori dei filamenti mostrano invece la libreria dell'host, la stessa di Mainsail e Kalico:
+- i filamenti CFS di sistema;
+- i tuoi filamenti personalizzati da `cfs_filaments.json`.
+
+**Dall'host allo schermo.** Ogni 30 s il servizio legge `printer.objects.box.filaments` da Moonraker. Se la libreria è cambiata, riscrive `/opt/helixscreen/assets/filaments.json`:
+- l'elenco dei prodotti viene sostituito (id `k2oh-<id Kalico>`, codice RFID del CFS in `codes.cfs`);
+- le tabelle dei tipi di materiale di HelixScreen restano invariate;
+- il file originale resta come `filaments.json.helix-orig`. Un aggiornamento di HelixScreen che scrive un nuovo catalogo diventa il nuovo originale.
+
+HelixScreen rilegge il catalogo ogni volta che si apre un selettore, quindi le modifiche compaiono senza riavvio. Solo la ricerca per codice RFID usa una cache: con `RESTART_HELIX=idle` (predefinito) il servizio riavvia HelixScreen una volta dopo una modifica, a stampante ferma.
+
+**Dallo schermo all'host.** Un filamento creato in HelixScreen finisce in `config/user_filaments.json`. A stampante ferma il servizio lo invia a Kalico:
+- con `_BOX_FILAMENT_SET ID=HXnnnn …`, poi lo toglie dall'overlay, perché ritorna con la libreria;
+- la modifica di un tuo filamento personalizzato viene inviata allo stesso modo, mantenendo il colore;
+- le modifiche ai filamenti di sistema, in sola lettura, restano una personalizzazione locale di HelixScreen.
+
+**Durante una stampa** il servizio legge soltanto Moonraker: nessun G-code e nessun riavvio di HelixScreen.
+
+**Impostazioni** in `/mnt/UDISK/.k2openhost/k2openhost.conf`:
+- `HELIX_FILAMENTS=off` disattiva il servizio;
+- `RESTART_HELIX=never` disattiva il riavvio.
+
+**Per tornare ai preset:**
+
+```sh
+/etc/init.d/k2oh-helix-filaments stop
+/etc/init.d/k2oh-helix-filaments disable
+k2oh-helix-filaments --restore
+```
+
+Log: `logread -e k2oh-helix`.
 
 ## Aggiornare il firmware di MCU, motori e CFS
 
@@ -440,6 +476,7 @@ Cosa manca agli strumenti Creality: sono binari chiusi, registrano meno informaz
 | `/mnt/UDISK/.k2openhost/backup/<data>/` | Ambiente U-Boot e slot B precedente. |
 | `/mnt/UDISK/.k2openhost/mcu-fw/<versione>/` | Set firmware scaricati. |
 | `/mnt/UDISK/.k2openhost/bin/k2oh-slot` | Cambio slot, usabile dallo slot A. |
+| `/mnt/UDISK/.k2openhost/helix-filaments.json` | Stato di `k2oh-helix-filaments` (riavvio di HelixScreen ancora da fare). |
 
 ### Costruzione a mano
 
