@@ -1,0 +1,377 @@
+#!/usr/bin/python3
+"""Show only the external host's filament library on HelixScreen.
+
+    k2oh-helix-filaments [--once] [--interval 30] [--restore]
+
+HelixScreen ships its own catalog (assets/filaments.json, ~360 presets) and
+merges config/user_filaments.json over it; the overlay can add or patch
+products but never hide a shipped one. This service replaces the shipped
+product list with the library Kalico publishes through Moonraker
+(printer.objects.box.filaments: the system CFS filaments plus the user's
+custom ones from cfs_filaments.json), so the HelixScreen pickers list exactly
+what the printer knows. The shipped file is kept as filaments.json.helix-orig
+(--restore puts it back); its material-type tables are reused unchanged.
+
+The other direction: a product created in HelixScreen lands in
+user_filaments.json. While the printer is idle it is sent to Kalico with
+_BOX_FILAMENT_SET (an edited custom Kalico product too) and then dropped from
+the overlay, because it comes back in the next catalog from Kalico. Edits to
+read-only system filaments stay a local HelixScreen override.
+
+HelixScreen re-reads the catalog every time a picker opens, so a new library
+shows up without a restart. Only its RFID-code lookup is cached until it
+restarts; with RESTART_HELIX=idle (default) the service restarts HelixScreen
+after a library change once the printer is idle. Nothing here runs while a
+print is printing or paused, apart from reading Moonraker.
+
+Settings come from /mnt/UDISK/.k2openhost/k2openhost.conf: MOONRAKER_URL,
+HELIX_FILAMENTS (on|off, default on), RESTART_HELIX (idle|never).
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+CONF = "/mnt/UDISK/.k2openhost/k2openhost.conf"
+HELIX_DIR = os.environ.get("K2OH_HELIX_DIR", "/opt/helixscreen")
+STATE = os.environ.get("K2OH_HELIX_STATE", "/mnt/UDISK/.k2openhost/helix-filaments.json")
+MARKER = "_k2openhost"
+ID_PREFIX = "k2oh-"
+NEW_ID_PREFIX = "HX"
+BUSY_STATES = ("printing", "paused")
+TEMP_MIN, TEMP_MAX = 170, 350  # _BOX_FILAMENT_SET TARGET_TEMP bounds
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def read_conf(path=CONF):
+    conf = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"\s*([A-Z_][A-Z0-9_]*)=(.*)$", line)
+                if m:
+                    conf[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return conf
+
+
+def paths(helix_dir=None):
+    d = helix_dir or HELIX_DIR
+    return {
+        "asset": os.path.join(d, "assets", "filaments.json"),
+        "orig": os.path.join(d, "assets", "filaments.json.helix-orig"),
+        "overlay": os.path.join(d, "config", "user_filaments.json"),
+    }
+
+
+def load_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, doc):
+    tmp = path + ".k2oh-tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.rename(tmp, path)
+
+
+# --- Moonraker ---------------------------------------------------------------
+
+class Moonraker:
+    def __init__(self, url, timeout=10.0):
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+
+    def query(self, objects):
+        q = "&".join(urllib.parse.quote(o, safe="=,") for o in objects)
+        with urllib.request.urlopen(self.url + "/printer/objects/query?" + q,
+                                    timeout=self.timeout) as r:
+            return json.load(r)["result"]["status"]
+
+    def library(self):
+        status = self.query(["box=filaments"])
+        lib = (status.get("box") or {}).get("filaments")
+        if not isinstance(lib, dict):
+            raise RuntimeError("Moonraker did not return box.filaments")
+        return lib
+
+    def print_state(self):
+        status = self.query(["print_stats=state"])
+        return (status.get("print_stats") or {}).get("state", "unknown")
+
+    def gcode(self, script):
+        req = urllib.request.Request(
+            self.url + "/printer/gcode/script",
+            data=json.dumps({"script": script}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r).get("result") == "ok"
+
+
+# --- Kalico -> HelixScreen -------------------------------------------------------
+
+def _int(value):
+    return int(value) if isinstance(value, (int, float)) and value > 0 else None
+
+
+def to_helix(entry):
+    """One Kalico filament as a HelixScreen product."""
+    kid = str(entry.get("id") or "").strip()
+    product = {
+        "id": ID_PREFIX + kid,
+        "brand": str(entry.get("brand") or ""),
+        "name": str(entry.get("name") or kid),
+        "type": str(entry.get("material") or ""),
+        "source": "k2openhost",
+    }
+    for key, src in (("nozzle", "target_temp"), ("nozzle_min", "min_temp"),
+                     ("nozzle_max", "max_temp")):
+        value = _int(entry.get(src))
+        if value is not None:
+            product[key] = value
+    code = str(entry.get("rfid_code") or "").strip()
+    if code:
+        product["codes"] = {"cfs": code}
+    return product
+
+
+def library_digest(library):
+    return hashlib.sha256(
+        json.dumps(library, sort_keys=True).encode()).hexdigest()
+
+
+def build_catalog(orig, library, digest):
+    """HelixScreen's catalog document with the product list replaced."""
+    doc = {k: v for k, v in (orig or {}).items() if k != "filaments"}
+    products = [to_helix(e) for _, e in sorted(library.items())
+                if isinstance(e, dict) and e.get("id")]
+    products.sort(key=lambda p: (p["brand"].lower(), p["name"].lower()))
+    doc["filaments"] = products
+    doc[MARKER] = {"library_sha256": digest, "count": len(products),
+                   "note": "generated by k2oh-helix-filaments; the shipped "
+                           "catalog is filaments.json.helix-orig"}
+    return doc
+
+
+def ensure_original(p):
+    """Keep the shipped catalog. A HelixScreen update writes a new one: the
+    asset then has no marker, and it becomes the new original."""
+    current = load_json(p["asset"])
+    if isinstance(current, dict) and MARKER not in current:
+        write_json(p["orig"], current)
+        return current
+    return load_json(p["orig"])
+
+
+def sync_catalog(p, library):
+    """Write the catalog if the library or the shipped file changed.
+    Returns True when the file was rewritten."""
+    orig = ensure_original(p)
+    if not isinstance(orig, dict):
+        raise RuntimeError("no HelixScreen catalog at %s" % p["asset"])
+    digest = library_digest(library)
+    current = load_json(p["asset"])
+    if (isinstance(current, dict)
+            and (current.get(MARKER) or {}).get("library_sha256") == digest):
+        return False
+    write_json(p["asset"], build_catalog(orig, library, digest))
+    return True
+
+
+def restore(p):
+    orig = load_json(p["orig"])
+    if not isinstance(orig, dict):
+        return False
+    write_json(p["asset"], orig)
+    os.remove(p["orig"])
+    return True
+
+
+# --- HelixScreen -> Kalico ---------------------------------------------------
+
+def overlay_products(doc):
+    if isinstance(doc, list):
+        return doc
+    if isinstance(doc, dict) and isinstance(doc.get("filaments"), list):
+        return doc["filaments"]
+    return []
+
+
+def _clean(text):
+    # G-code parameters: no quotes, no newlines, no semicolons (comments).
+    return re.sub(r'["\r\n;]', "", str(text or "")).strip()
+
+
+def next_new_id(library, used):
+    taken = {str(k).upper() for k in library} | {u.upper() for u in used}
+    n = 1
+    while "%s%04d" % (NEW_ID_PREFIX, n) in taken:
+        n += 1
+    return "%s%04d" % (NEW_ID_PREFIX, n)
+
+
+def filament_set_command(kid, product, existing=None):
+    """_BOX_FILAMENT_SET for one HelixScreen product, or None if unusable."""
+    existing = existing or {}
+    material = _clean(product.get("type") or existing.get("material"))
+    if not material:
+        return None
+    parts = ["_BOX_FILAMENT_SET", "ID=%s" % _clean(kid), "MATERIAL=%s" % material]
+    brand = _clean(product.get("brand", existing.get("brand", "")))
+    name = _clean(product.get("name", existing.get("name", "")))
+    if brand:
+        parts.append('BRAND="%s"' % brand)
+    if name:
+        parts.append('NAME="%s"' % name)
+    nozzle = _int(product.get("nozzle"))
+    if nozzle is not None:
+        parts.append("TARGET_TEMP=%d" % max(TEMP_MIN, min(TEMP_MAX, nozzle)))
+    lo, hi = _int(product.get("nozzle_min")), _int(product.get("nozzle_max"))
+    if lo is not None and hi is not None and lo <= hi:
+        parts.append("MIN_TEMP=%d MAX_TEMP=%d" % (lo, hi))
+    color = str(existing.get("color") or "")
+    if re.match(r"^#[0-9A-Fa-f]{6}$", color):
+        parts.append("COLOR=%s" % color)
+    return " ".join(parts)
+
+
+def import_overlay(p, library, moonraker):
+    """Send HelixScreen-made products to Kalico; drop the ones that landed.
+    Returns the number sent."""
+    doc = load_json(p["overlay"])
+    products = overlay_products(doc)
+    if not products:
+        return 0
+    try:
+        mtime = os.stat(p["overlay"]).st_mtime_ns
+    except OSError:
+        return 0
+    keep, sent, used = [], 0, []
+    for product in products:
+        if not isinstance(product, dict):
+            keep.append(product)
+            continue
+        pid = str(product.get("id") or "")
+        existing = None
+        if pid.startswith(ID_PREFIX):
+            kid = pid[len(ID_PREFIX):]
+            existing = library.get(kid)
+            if existing is None or existing.get("system"):
+                keep.append(product)  # system filament: local override only
+                continue
+        else:
+            kid = next_new_id(library, used)
+            used.append(kid)
+        command = filament_set_command(kid, product, existing)
+        if command is None:
+            keep.append(product)
+            continue
+        try:
+            ok = moonraker.gcode(command)
+        except Exception as exc:  # Moonraker answers 400 on a refused command
+            log("import of %r failed: %s" % (product.get("name"), exc))
+            ok = False
+        if ok:
+            sent += 1
+            log("sent to Kalico: %s (%s)" % (product.get("name"), kid))
+        else:
+            keep.append(product)
+    if sent:
+        # HelixScreen may have saved meanwhile: then leave the file for the
+        # next pass instead of overwriting its write.
+        if os.stat(p["overlay"]).st_mtime_ns == mtime:
+            if isinstance(doc, dict):
+                doc = dict(doc)
+                doc["filaments"] = keep
+            else:
+                doc = keep
+            write_json(p["overlay"], doc)
+    return sent
+
+
+def restart_helix():
+    subprocess.run(["/etc/init.d/helixscreen", "restart"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# --- loop ----------------------------------------------------------------------
+
+def save_state(state):
+    try:
+        write_json(STATE, state)
+    except OSError:
+        pass
+
+
+def run_once(p, moonraker, state, restart_mode="idle"):
+    library = moonraker.library()
+    print_state = moonraker.print_state()
+    idle = print_state not in BUSY_STATES
+    if idle and import_overlay(p, library, moonraker):
+        library = moonraker.library()
+    if sync_catalog(p, library):
+        state["restart_pending"] = True
+        log("HelixScreen catalog: %d filaments from the host library"
+            % len(library))
+    if state.get("restart_pending") and idle and restart_mode == "idle":
+        restart_helix()
+        state["restart_pending"] = False
+        log("HelixScreen restarted to refresh its RFID-code cache")
+    return idle
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="k2oh-helix-filaments")
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--interval", type=float, default=30.0)
+    ap.add_argument("--restore", action="store_true",
+                    help="put HelixScreen's shipped catalog back and exit")
+    args = ap.parse_args(argv)
+    conf = read_conf()
+    p = paths()
+    if args.restore:
+        log("shipped catalog restored" if restore(p) else "nothing to restore")
+        return 0
+    if conf.get("HELIX_FILAMENTS", "on").lower() == "off":
+        log("HELIX_FILAMENTS=off in %s" % CONF)
+        return 0
+    url = conf.get("MOONRAKER_URL") or "http://%s:%s" % (
+        conf.get("HOST_IP", "127.0.0.1"), conf.get("MOONRAKER_PORT", "7125"))
+    moonraker = Moonraker(url)
+    restart_mode = conf.get("RESTART_HELIX", "idle").lower()
+    state = load_json(STATE, {}) or {}
+    failures = 0
+    while True:
+        try:
+            run_once(p, moonraker, state, restart_mode)
+            if failures:
+                log("host library reachable again")
+            failures = 0
+            save_state(state)
+        except Exception as exc:
+            if failures == 0:
+                log("cannot sync the filament library yet: %s" % exc)
+            failures += 1
+        if args.once:
+            return 0 if failures == 0 else 1
+        time.sleep(args.interval if failures == 0 else min(300.0, args.interval * 2))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
