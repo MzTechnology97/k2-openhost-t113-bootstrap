@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **HelixScreen lists only the host's filament library** (`k2oh-helix-filaments`, S98):
+  - the shipped presets are replaced by Kalico's `box.filaments` (system CFS filaments plus custom ones), kept in sync every 30 s;
+  - filaments created in HelixScreen go to Kalico with `_BOX_FILAMENT_SET`, only while the printer is idle;
+  - the shipped catalog stays as `filaments.json.helix-orig` and `--restore` puts it back.
 - **Custom CFS images are checked against the real application base, `0x08003000`.** The container check expected the reset vector inside `0x08010000 + size`, an analysis convention, not the address the CFS loader writes to: the loader writes every image from `0x08003000` and the host sends no address. Stock 150, 122 and 153 passed only because their reset vectors also fall in the wrong window; `cfs6_222_000` (reset `0x08004145`) and any small image were refused, and a reset vector past the end of the image could pass.
 - **A custom CFS image must end below the parameter page** at `0x0807f800`: at most `0x7c800` bytes. The loader itself does not check this.
 
