@@ -33,11 +33,12 @@ This turns the printer's T113 board into a ready K2-OpenHost bridge: USB gadget 
 5. [Updating the programs without reinstalling](#updating-the-programs-without-reinstalling)
 6. [What runs in slot B](#what-runs-in-slot-b)
 7. [Control service (k2oh-ctl)](#control-service-k2oh-ctl)
-8. [Updating MCU, motor and CFS firmware](#updating-mcu-motor-and-cfs-firmware)
-9. [Why Creality's updater and not Jacob's](#why-creality-s-updater-and-not-jacob-s)
-10. [Troubleshooting](#troubleshooting)
-11. [Removing it](#removing-it)
-12. [Reference](#reference)
+8. [HelixScreen filament list (k2oh-helix-filaments)](#helixscreen-filament-list-k2oh-helix-filaments)
+9. [Updating MCU, motor and CFS firmware](#updating-mcu-motor-and-cfs-firmware)
+10. [Why Creality's updater and not Jacob's](#why-creality-s-updater-and-not-jacob-s)
+11. [Troubleshooting](#troubleshooting)
+12. [Removing it](#removing-it)
+13. [Reference](#reference)
 
 ## How it works
 
@@ -168,6 +169,7 @@ Only a reinstall changes the kernel, `lib/preinit/80_mount_root` (it runs before
 | `k2oh-linkstat` | Optional sampler for long prints: CPU, interrupts, UART error deltas, gadget state and bridge counters every 10 s to a CSV in RAM. Start it by hand: `k2oh-linkstat --out /tmp/k2oh-linkstat.csv &`. |
 | `k2oh-mcu` (S54) | At every boot, one step after the other: it power-cycles the MCU rail (stock `mcu_reset.sh`), runs Creality's `mcu_update`, then starts the bridges. `mcu_update` starts every board from its loader and reflashes any board whose version differs from slot B's firmware files. In slot B it has no boot link of its own: on the first boot procd ran it while the bridges already read the same UARTs, the handshake failed and the boards stayed in the loader. The power cycle also covers a reboot of the T113 alone, which leaves the boards running the previous host session. Log: `logread -e k2oh-mcu`, `/tmp/mcu_update.log`. |
 | `k2oh-ctl` | Control service for the external host: telemetry, MCU power rail, buzzer, bridges, HelixScreen. See [Control service](#control-service-k2oh-ctl). |
+| `k2oh-helix-filaments` (S98) | HelixScreen lists only the host's filament library (Kalico's CFS system filaments plus your custom ones), not its own presets. See [HelixScreen filament list](#helixscreen-filament-list-k2oh-helix-filaments). |
 | `k2oh-wifi` | Starts `wpa_supplicant` and `udhcpc` like Creality's `wifi-server` did, with the networks copied from slot A. Ethernet works as in stock. |
 | `k2oh-firstboot` / `k2oh-setup` | First boot: installs HelixScreen from the prepared archive and points it at `HOST_IP:7125`. Retried at each boot until it succeeds. `k2oh-setup --host <IP>` changes the host later (menu 29). |
 | HelixScreen | The touch UI on the printer screen, connected to Moonraker on the host. |
@@ -235,6 +237,40 @@ The installer helper writes this file for you.
 - an e-stop followed by power on.
 
 The rest of slot B has not been booted on a printer yet.
+
+## HelixScreen filament list (k2oh-helix-filaments)
+
+HelixScreen ships its own catalog of about 360 presets. In slot B its filament pickers show the host's library instead, the one Mainsail and Kalico use:
+- the CFS system filaments;
+- your custom ones from `cfs_filaments.json`.
+
+**From the host to the screen.** Every 30 s the service reads `printer.objects.box.filaments` from Moonraker. When the library changed, it rewrites `/opt/helixscreen/assets/filaments.json`:
+- the product list is replaced (ids `k2oh-<Kalico id>`, CFS RFID code as `codes.cfs`);
+- HelixScreen's material-type tables are kept as they are;
+- the shipped file is kept as `filaments.json.helix-orig`. A HelixScreen update that writes a new catalog becomes the new original.
+
+HelixScreen reads the catalog every time a picker opens, so a change appears without a restart. Only its RFID-code lookup is cached: with `RESTART_HELIX=idle` (default) the service restarts HelixScreen once after a change, when the printer is idle.
+
+**From the screen to the host.** A filament created in HelixScreen goes to `config/user_filaments.json`. While the printer is idle the service sends it to Kalico:
+- with `_BOX_FILAMENT_SET ID=HXnnnn …`, then drops it from the overlay, because it comes back with the library;
+- an edit of one of your custom filaments is sent the same way, keeping its colour;
+- edits to read-only system filaments stay a local HelixScreen override.
+
+**During a print** the service only reads Moonraker: no G-code, no HelixScreen restart.
+
+**Settings** in `/mnt/UDISK/.k2openhost/k2openhost.conf`:
+- `HELIX_FILAMENTS=off` turns the service off;
+- `RESTART_HELIX=never` disables the restart.
+
+**Going back to the presets:**
+
+```sh
+/etc/init.d/k2oh-helix-filaments stop
+/etc/init.d/k2oh-helix-filaments disable
+k2oh-helix-filaments --restore
+```
+
+Log: `logread -e k2oh-helix`.
 
 ## Updating MCU, motor and CFS firmware
 
@@ -448,6 +484,7 @@ What Creality's tools lack: they are closed binaries, they log less, and they re
 | `/mnt/UDISK/.k2openhost/backup/<date>/` | U-Boot environment and previous slot B. |
 | `/mnt/UDISK/.k2openhost/mcu-fw/<version>/` | Downloaded firmware sets. |
 | `/mnt/UDISK/.k2openhost/bin/k2oh-slot` | Slot switch, usable from slot A. |
+| `/mnt/UDISK/.k2openhost/helix-filaments.json` | `k2oh-helix-filaments` state (a HelixScreen restart still due). |
 
 ### Building by hand
 
