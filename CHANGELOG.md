@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Wi-Fi power save off** (`k2oh-wifi`): the T113 radio dozed with power save on, and HelixScreen's websocket to Moonraker on the external host dropped often (59 disconnects in 12 days on the reference printer, 17 with a stalled reconnect).
 - **HelixScreen lists only the host's filament library** (`k2oh-helix-filaments`, S98):
   - the shipped presets are replaced by Kalico's `box.filaments` (system CFS filaments plus custom ones), kept in sync every 30 s;
   - filaments created in HelixScreen go to Kalico with `_BOX_FILAMENT_SET`, only while the printer is idle;
