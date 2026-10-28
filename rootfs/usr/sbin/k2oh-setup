@@ -214,6 +214,29 @@ def point_helix_wait(host, port):
     return True
 
 
+USTREAMER_INIT = "/etc/init.d/ustreamer"
+
+
+def disable_helix_camera(init=None, rc_dir="/etc/rc.d"):
+    """Stop the camera server HelixScreen's K2 installer sets up.
+
+    The installer always serves /dev/video0 with ustreamer, but in OpenHost
+    mode the cameras are wired to the external host: on the T113 it only
+    retries a missing device and kills cam_app every few seconds.
+    """
+    init = init or USTREAMER_INIT
+    try:
+        enabled = any(name.endswith("ustreamer") for name in os.listdir(rc_dir))
+    except OSError:
+        enabled = False
+    if not (os.path.exists(init) and enabled):
+        return False
+    subprocess.run([init, "stop"], stdin=subprocess.DEVNULL)
+    subprocess.run([init, "disable"], stdin=subprocess.DEVNULL)
+    log("HelixScreen's camera server disabled (cameras are on the external host)")
+    return True
+
+
 TOKEN = os.path.join(K2OH_DIR, "ctl.token")
 
 
@@ -249,6 +272,7 @@ def apply(conf):
         subprocess.run(["/etc/init.d/k2oh-ctl", "restart"], stdin=subprocess.DEVNULL)
     helix_ok = install_helix(conf)
     point_helix(host, port)
+    disable_helix_camera()
     if not helix_ok:
         log("setup incomplete: HelixScreen is retried at the next boot (or run k2oh-setup)")
         return 1
