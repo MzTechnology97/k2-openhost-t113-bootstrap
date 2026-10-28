@@ -103,3 +103,25 @@ def test_restart_helix_stops_leftovers_before_start(tmp_path, monkeypatch):
     killed = sorted(e[1] for e in events if isinstance(e, tuple))
     assert killed == [10, 12]
     assert all(e[2] == setup.signal.SIGTERM for e in events if isinstance(e, tuple))
+
+
+def test_helix_camera_server_is_disabled_once(tmp_path, monkeypatch):
+    init = tmp_path / "ustreamer"
+    init.write_text("#!/bin/sh /etc/rc.common\n")
+    rc_dir = tmp_path / "rc.d"
+    rc_dir.mkdir()
+    (rc_dir / "S95ustreamer").write_text("")
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv[1])
+        if argv[1] == "disable":
+            (rc_dir / "S95ustreamer").unlink()
+
+    monkeypatch.setattr(setup.subprocess, "run", run)
+    assert setup.disable_helix_camera(str(init), str(rc_dir)) is True
+    assert calls == ["stop", "disable"]
+    # Already disabled, or no camera server installed: nothing to do.
+    assert setup.disable_helix_camera(str(init), str(rc_dir)) is False
+    assert setup.disable_helix_camera(str(tmp_path / "missing"), str(rc_dir)) is False
+    assert calls == ["stop", "disable"]
