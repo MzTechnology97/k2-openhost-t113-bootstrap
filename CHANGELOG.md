@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **HelixScreen replaced from a release archive** (`k2oh-setup helix-update <archive>`, `helix-restore`): only while the printer is idle (a host that does not answer counts as busy). The installed HelixScreen and its init scripts are saved to `helix-backup/<date>`, the release's own installer runs with `--update`, then the boot wait on the host's Moonraker and the disabled camera server are put back. `helix-restore` puts the last saved one back and moves the replaced one to `trash/`.
 - **Wi-Fi power save off** (`k2oh-wifi`): the T113 radio dozed with power save on, and HelixScreen's websocket to Moonraker on the external host dropped often (59 disconnects in 12 days on the reference printer, 17 with a stalled reconnect).
 - **HelixScreen lists only the host's filament library** (`k2oh-helix-filaments`, S98):
   - the shipped presets are replaced by Kalico's `box.filaments` (system CFS filaments plus custom ones), kept in sync every 30 s;

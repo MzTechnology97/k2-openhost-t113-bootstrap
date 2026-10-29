@@ -4,6 +4,10 @@
     k2oh-setup                 apply /mnt/UDISK/.k2openhost/k2openhost.conf
     k2oh-setup --host IP       change the external host and apply
     k2oh-setup status          show the configuration
+    k2oh-setup helix-update ARCHIVE
+                               replace HelixScreen with a release archive
+                               (printer idle only; the old one is saved)
+    k2oh-setup helix-restore   put the last saved HelixScreen back
 
 The configuration is written by the host installer (helper.sh, T113 menu):
 
@@ -21,10 +25,14 @@ B runs this automatically (/etc/init.d/k2oh-firstboot).
 import ipaddress
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
+import urllib.request
 
 K2OH_DIR = "/mnt/UDISK/.k2openhost"
 CONF = os.path.join(K2OH_DIR, "k2openhost.conf")
@@ -161,6 +169,11 @@ def restart_helix(proc="/proc", wait=5.0):
     launcher running: two watchdogs then fought over one screen ("Another
     instance of helix-screen is already running").
     """
+    stop_helix(proc, wait)
+    subprocess.run([HELIX_INIT, "start"], stdin=subprocess.DEVNULL)
+
+
+def stop_helix(proc="/proc", wait=5.0):
     subprocess.run([HELIX_INIT, "stop"], stdin=subprocess.DEVNULL)
     pids = helix_pids(proc)
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -177,7 +190,6 @@ def restart_helix(proc="/proc", wait=5.0):
             break
     if pids:
         log("HelixScreen processes still running after SIGKILL: %s" % pids)
-    subprocess.run([HELIX_INIT, "start"], stdin=subprocess.DEVNULL)
 
 
 WAIT_MARK = "# k2oh-setup: Moonraker runs on the external host"
@@ -235,6 +247,95 @@ def disable_helix_camera(init=None, rc_dir="/etc/rc.d"):
     subprocess.run([init, "disable"], stdin=subprocess.DEVNULL)
     log("HelixScreen's camera server disabled (cameras are on the external host)")
     return True
+
+
+HELIX_DIR = "/opt/helixscreen"
+HELIX_SERVICE = "/etc/init.d/helixscreen"
+HELIX_BACKUPS = os.path.join(K2OH_DIR, "helix-backup")
+IDLE_STATES = ("standby", "complete", "cancelled", "error")
+
+
+def print_state(conf):
+    url = conf.get("MOONRAKER_URL") or "http://%s:%s" % (
+        conf.get("HOST_IP", ""), conf.get("MOONRAKER_PORT", "7125"))
+    try:
+        with urllib.request.urlopen(url + "/printer/objects/query?print_stats=state",
+                                    timeout=10) as r:
+            return json.load(r)["result"]["status"]["print_stats"]["state"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return "unreachable"
+
+
+def helix_swap_allowed(conf):
+    """HelixScreen is replaced only while the printer is idle; a host that
+    does not answer may still be printing."""
+    state = print_state(conf)
+    if state in IDLE_STATES:
+        return True
+    log("printer state is %s: HelixScreen is replaced only while it is idle" % state)
+    return False
+
+
+def save_helix(dest):
+    """Copy the installed HelixScreen (config included) and its init scripts."""
+    os.makedirs(os.path.join(dest, "init.d"))
+    shutil.copytree(HELIX_DIR, os.path.join(dest, "helixscreen"), symlinks=True)
+    for path in (HELIX_INIT, HELIX_SERVICE):
+        if os.path.isfile(path):
+            shutil.copy2(path, os.path.join(dest, "init.d"))
+
+
+def update_helix(conf, archive):
+    """Install a HelixScreen release archive over the running one.
+
+    The release's own installer runs in --update mode (it keeps config/ and
+    rewrites the init scripts), then the K2-OpenHost changes are put back:
+    the boot wait on the external Moonraker, and no camera server.
+    """
+    if not os.path.isfile(archive):
+        log("HelixScreen archive not found: %s" % archive)
+        return 1
+    if not helix_swap_allowed(conf):
+        return 1
+    backup = os.path.join(HELIX_BACKUPS, time.strftime("%Y%m%d-%H%M%S"))
+    save_helix(backup)
+    log("installed HelixScreen saved to %s" % backup)
+    with tempfile.TemporaryDirectory() as work:
+        installer = os.path.join(work, "install.sh")
+        with tarfile.open(archive) as tar, open(installer, "wb") as f:
+            f.write(tar.extractfile("helixscreen/install.sh").read())
+        result = subprocess.run(["sh", installer, "--update", "--local", archive,
+                                 "--skip-kiauh-registration"], stdin=subprocess.DEVNULL)
+    if result.returncode != 0:
+        log("HelixScreen installer failed (exit %d); `k2oh-setup helix-restore` "
+            "puts the saved one back" % result.returncode)
+        return 1
+    point_helix(conf.get("HOST_IP", ""), conf.get("MOONRAKER_PORT", "7125"))
+    disable_helix_camera()
+    log("HelixScreen updated from %s" % os.path.basename(archive))
+    return 0
+
+
+def restore_helix(conf):
+    """Put the last saved HelixScreen back; the replaced one goes to trash/."""
+    try:
+        backup = os.path.join(HELIX_BACKUPS, sorted(os.listdir(HELIX_BACKUPS))[-1])
+    except (OSError, IndexError):
+        log("no saved HelixScreen in %s" % HELIX_BACKUPS)
+        return 1
+    if not helix_swap_allowed(conf):
+        return 1
+    stop_helix()
+    trash = os.path.join(K2OH_DIR, "trash", "helixscreen-" + time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(os.path.dirname(trash), exist_ok=True)
+    shutil.move(HELIX_DIR, trash)
+    shutil.copytree(os.path.join(backup, "helixscreen"), HELIX_DIR, symlinks=True)
+    for name in os.listdir(os.path.join(backup, "init.d")):
+        shutil.copy2(os.path.join(backup, "init.d", name), os.path.dirname(HELIX_INIT))
+    disable_helix_camera()
+    subprocess.run([HELIX_INIT, "start"], stdin=subprocess.DEVNULL)
+    log("HelixScreen restored from %s; the replaced one is in %s" % (backup, trash))
+    return 0
 
 
 TOKEN = os.path.join(K2OH_DIR, "ctl.token")
@@ -295,6 +396,10 @@ def main():
         print("Setup         : %s" % ("done" if os.path.exists(DONE) else "pending"))
         print("HelixScreen   : %s" % ("installed" if helix_installed() else "not installed"))
         return 0
+    if args[:1] == ["helix-update"] and len(args) == 2:
+        return update_helix(conf, args[1])
+    if args == ["helix-restore"]:
+        return restore_helix(conf)
     if args[:1] == ["--host"] and len(args) == 2:
         if not valid_host(args[1]):
             print("k2oh-setup: invalid host %r" % args[1], file=sys.stderr)
