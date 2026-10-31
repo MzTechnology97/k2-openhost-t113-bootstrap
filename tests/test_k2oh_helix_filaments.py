@@ -178,3 +178,35 @@ def test_new_ids_skip_taken_ones():
     lib = {"HX0001": {}, "hx0002": {}}
     assert hf.next_new_id(lib, []) == "HX0003"
     assert hf.next_new_id(lib, ["HX0003"]) == "HX0004"
+
+
+def release(helix, version):
+    pathlib.Path(helix["release"]).write_text(json.dumps({"version": version}))
+
+
+@pytest.mark.parametrize("version,native", [
+    ("v1.0.6-k2oh.8", True), ("v1.0.6-k2oh.12", True), ("v1.1.0-k2oh.8", True),
+    ("v1.0.6-k2oh.7", False), ("v1.0.6", False), ("", False)])
+def test_native_helix_is_recognised(helix, version, native):
+    release(helix, version)
+    assert hf.helix_reads_library(helix) is native
+
+
+def test_no_release_info_keeps_the_service(helix):
+    assert hf.retire(helix) is False
+
+
+def test_retire_restores_the_shipped_catalog(helix):
+    hf.sync_catalog(helix, LIBRARY)
+    release(helix, "v1.0.6-k2oh.8")
+    assert hf.retire(helix) is True
+    assert read(helix["asset"]) == SHIPPED
+    assert not os.path.exists(helix["orig"])
+    assert hf.retire(helix) is True  # nothing left to restore, still retired
+
+
+def test_retire_flag_exit_codes(helix, monkeypatch):
+    monkeypatch.setattr(hf, "paths", lambda helix_dir=None: helix)
+    assert hf.main(["--retire"]) == 1
+    release(helix, "v1.0.6-k2oh.8")
+    assert hf.main(["--retire"]) == 0
