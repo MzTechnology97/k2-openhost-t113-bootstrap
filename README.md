@@ -244,6 +244,8 @@ HelixScreen ships its own catalog of about 360 presets. In slot B its filament p
 - the CFS system filaments;
 - your custom ones from `cfs_filaments.json`.
 
+**With the K2-OpenHost HelixScreen build 1.0.6-k2oh.8 or later this service is not needed and does not start.** That build reads `box.filaments` live (no file rewrite, no restart for the RFID lookup) and saves a filament created on the screen straight into Kalico with `_BOX_FILAMENT_SET`. At the first boot with it, or as soon as it is installed from the screen, the service puts the shipped `filaments.json` back and stays idle (`k2oh-helix-filaments --retire`). What follows describes older builds.
+
 **From the host to the screen.** Every 30 s the service reads `printer.objects.box.filaments` from Moonraker. When the library changed, it rewrites `/opt/helixscreen/assets/filaments.json`:
 - the product list is replaced (ids `k2oh-<Kalico id>`, CFS RFID code as `codes.cfs`);
 - HelixScreen's material-type tables are kept as they are;

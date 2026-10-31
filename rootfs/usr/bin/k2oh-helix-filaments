@@ -26,6 +26,12 @@ print is printing or paused, apart from reading Moonraker.
 
 Settings come from /mnt/UDISK/.k2openhost/k2openhost.conf: MOONRAKER_URL,
 HELIX_FILAMENTS (on|off, default on), RESTART_HELIX (idle|never).
+
+The K2-OpenHost HelixScreen build from 1.0.6-k2oh.8 reads box.filaments
+itself and saves new filaments straight into Kalico. With it installed this
+service retires: --retire (run by the init script before starting) puts the
+shipped catalog back and the service does not start; a running service that
+sees the new build arrive (in-app update) does the same and then idles.
 """
 
 import argparse
@@ -46,6 +52,7 @@ MARKER = "_k2openhost"
 ID_PREFIX = "k2oh-"
 NEW_ID_PREFIX = "HX"
 BUSY_STATES = ("printing", "paused")
+NATIVE_K2OH = 8  # first HelixScreen K2-OpenHost build with the library built in
 TEMP_MIN, TEMP_MAX = 170, 350  # _BOX_FILAMENT_SET TARGET_TEMP bounds
 
 
@@ -72,6 +79,7 @@ def paths(helix_dir=None):
         "asset": os.path.join(d, "assets", "filaments.json"),
         "orig": os.path.join(d, "assets", "filaments.json.helix-orig"),
         "overlay": os.path.join(d, "config", "user_filaments.json"),
+        "release": os.path.join(d, "release_info.json"),
     }
 
 
@@ -191,6 +199,22 @@ def sync_catalog(p, library):
             and (current.get(MARKER) or {}).get("library_sha256") == digest):
         return False
     write_json(p["asset"], build_catalog(orig, library, digest))
+    return True
+
+
+def helix_reads_library(p):
+    """True when the installed HelixScreen takes the library from Kalico."""
+    info = load_json(p["release"], {}) or {}
+    m = re.search(r"-k2oh\.(\d+)$", str(info.get("version") or ""))
+    return bool(m) and int(m.group(1)) >= NATIVE_K2OH
+
+
+def retire(p):
+    """Leave the catalog to HelixScreen. True when this service is not needed."""
+    if not helix_reads_library(p):
+        return False
+    if restore(p):
+        log("HelixScreen reads the host library itself: shipped catalog restored")
     return True
 
 
@@ -342,12 +366,17 @@ def main(argv=None):
     ap.add_argument("--interval", type=float, default=30.0)
     ap.add_argument("--restore", action="store_true",
                     help="put HelixScreen's shipped catalog back and exit")
+    ap.add_argument("--retire", action="store_true",
+                    help="exit 0 (catalog restored) if HelixScreen reads the "
+                         "library itself, 1 if this service is still needed")
     args = ap.parse_args(argv)
     conf = read_conf()
     p = paths()
     if args.restore:
         log("shipped catalog restored" if restore(p) else "nothing to restore")
         return 0
+    if args.retire:
+        return 0 if retire(p) else 1
     if conf.get("HELIX_FILAMENTS", "on").lower() == "off":
         log("HELIX_FILAMENTS=off in %s" % CONF)
         return 0
@@ -358,6 +387,10 @@ def main(argv=None):
     state = load_json(STATE, {}) or {}
     failures = 0
     while True:
+        if retire(p):
+            # procd would respawn an exit; the next boot does not start us.
+            while True:
+                time.sleep(86400)
         try:
             run_once(p, moonraker, state, restart_mode)
             if failures:

@@ -3,6 +3,7 @@
 # (k2oh-helix-filaments). Reads Moonraker; never touches a running print.
 # Off with HELIX_FILAMENTS=off in /mnt/UDISK/.k2openhost/k2openhost.conf;
 # `k2oh-helix-filaments --restore` puts HelixScreen's own catalog back.
+# Not started with HelixScreen 1.0.6-k2oh.8 or later (--retire).
 
 START=98
 STOP=08
@@ -10,6 +11,8 @@ USE_PROCD=1
 
 start_service() {
 	[ -f /mnt/UDISK/.k2openhost/k2openhost.conf ] || return 0
+	# HelixScreen 1.0.6-k2oh.8+ reads the library itself: catalog restored, no service.
+	/usr/bin/python3 /usr/bin/k2oh-helix-filaments --retire && return 0
 	procd_open_instance
 	procd_set_param command /usr/bin/python3 /usr/bin/k2oh-helix-filaments
 	procd_set_param respawn 3600 30 0
