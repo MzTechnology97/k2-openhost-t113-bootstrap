@@ -231,6 +231,8 @@ HelixScreen include un suo catalogo di circa 360 preset. Nello slot B i selettor
 - i filamenti CFS di sistema;
 - i tuoi filamenti personalizzati da `cfs_filaments.json`.
 
+**Con la build HelixScreen K2-OpenHost 1.0.6-k2oh.8 o successive questo servizio non serve e non parte.** Quella build legge `box.filaments` dal vivo (nessun file riscritto, nessun riavvio per la ricerca RFID) e salva un filamento creato dallo schermo direttamente in Kalico con `_BOX_FILAMENT_SET`. Al primo avvio con quella build, o appena viene installata dallo schermo, il servizio rimette il `filaments.json` originale e resta fermo (`k2oh-helix-filaments --retire`). Quanto segue riguarda le build precedenti.
+
 **Dall'host allo schermo.** Ogni 30 s il servizio legge `printer.objects.box.filaments` da Moonraker. Se la libreria è cambiata, riscrive `/opt/helixscreen/assets/filaments.json`:
 - l'elenco dei prodotti viene sostituito (id `k2oh-<id Kalico>`, codice RFID del CFS in `codes.cfs`);
 - le tabelle dei tipi di materiale di HelixScreen restano invariate;
