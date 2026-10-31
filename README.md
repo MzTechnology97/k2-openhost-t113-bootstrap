@@ -169,7 +169,7 @@ Only a reinstall changes the kernel, `lib/preinit/80_mount_root` (it runs before
 | `k2oh-linkstat` | Optional sampler for long prints: CPU, interrupts, UART error deltas, gadget state and bridge counters every 10 s to a CSV in RAM. Start it by hand: `k2oh-linkstat --out /tmp/k2oh-linkstat.csv &`. |
 | `k2oh-mcu` (S54) | At every boot, one step after the other: it power-cycles the MCU rail (stock `mcu_reset.sh`), runs Creality's `mcu_update`, then starts the bridges. `mcu_update` starts every board from its loader and reflashes any board whose version differs from slot B's firmware files. In slot B it has no boot link of its own: on the first boot procd ran it while the bridges already read the same UARTs, the handshake failed and the boards stayed in the loader. The power cycle also covers a reboot of the T113 alone, which leaves the boards running the previous host session. Log: `logread -e k2oh-mcu`, `/tmp/mcu_update.log`. |
 | `k2oh-ctl` | Control service for the external host: telemetry, MCU power rail, buzzer, bridges, HelixScreen. See [Control service](#control-service-k2oh-ctl). |
-| `k2oh-helix-filaments` (S98) | HelixScreen lists only the host's filament library (Kalico's CFS system filaments plus your custom ones), not its own presets. See [HelixScreen filament list](#helixscreen-filament-list-k2oh-helix-filaments). |
+| `k2oh-helix-filaments` (S98) | Only for HelixScreen builds older than 1.0.6-k2oh.8: HelixScreen lists only the host's filament library (Kalico's CFS system filaments plus your custom ones), not its own presets. See [HelixScreen filament list](#helixscreen-filament-list-k2oh-helix-filaments). |
 | `k2oh-wifi` | Starts `wpa_supplicant` and `udhcpc` like Creality's `wifi-server` did, with the networks copied from slot A, and turns Wi-Fi power save off (it stalled HelixScreen's connection to Moonraker). Ethernet works as in stock. |
 | `k2oh-firstboot` / `k2oh-setup` | First boot: installs HelixScreen from the prepared archive and points it at `HOST_IP:7125`. Retried at each boot until it succeeds. `k2oh-setup --host <IP>` changes the host later (menu 29). `k2oh-setup helix-update <archive>` replaces HelixScreen with another release archive (for example the K2-OpenHost fork build), only while the printer is idle: the installed one is saved to `helix-backup/<date>` and `k2oh-setup helix-restore` puts it back. |
 | HelixScreen | The touch UI on the printer screen, connected to Moonraker on the host. |
@@ -236,35 +236,20 @@ The installer helper writes this file for you.
 - a power cycle (ready in 9 s, CFS 16 s, motors 21 s);
 - an e-stop followed by power on.
 
-The rest of slot B has not been booted on a printer yet.
+Slot B as a whole runs on the reference printer since 2026-10-06: see [What was tested](#what-was-tested).
 
 ## HelixScreen filament list (k2oh-helix-filaments)
 
-HelixScreen ships its own catalog of about 360 presets. In slot B its filament pickers show the host's library instead, the one Mainsail and Kalico use:
-- the CFS system filaments;
-- your custom ones from `cfs_filaments.json`.
+HelixScreen ships its own catalog of about 360 presets. On K2-OpenHost its filament pickers show the host's library instead, the one Mainsail and Kalico use: the CFS system filaments plus your custom ones from `cfs_filaments.json`.
 
-**With the K2-OpenHost HelixScreen build 1.0.6-k2oh.8 or later this service is not needed and does not start.** That build reads `box.filaments` live (no file rewrite, no restart for the RFID lookup) and saves a filament created on the screen straight into Kalico with `_BOX_FILAMENT_SET`. At the first boot with it, or as soon as it is installed from the screen, the service puts the shipped `filaments.json` back and stays idle (`k2oh-helix-filaments --retire`). What follows describes older builds.
+The K2-OpenHost HelixScreen build 1.0.6-k2oh.8 or later does this by itself: it reads `box.filaments` live and saves a filament created on the screen into Kalico with `_BOX_FILAMENT_SET`. With that build the service puts the shipped `filaments.json` back and stays idle (`k2oh-helix-filaments --retire`).
 
-**From the host to the screen.** Every 30 s the service reads `printer.objects.box.filaments` from Moonraker. When the library changed, it rewrites `/opt/helixscreen/assets/filaments.json`:
-- the product list is replaced (ids `k2oh-<Kalico id>`, CFS RFID code as `codes.cfs`);
-- HelixScreen's material-type tables are kept as they are;
-- the shipped file is kept as `filaments.json.helix-orig`. A HelixScreen update that writes a new catalog becomes the new original.
+With older builds the service does the work:
+- every 30 s it reads `box.filaments` from Moonraker. When the library changed it rewrites `/opt/helixscreen/assets/filaments.json` (ids `k2oh-<Kalico id>`, the shipped file kept as `filaments.json.helix-orig`) and, with `RESTART_HELIX=idle` (default), restarts HelixScreen once while idle to refresh its RFID lookup;
+- while idle it sends filaments created on the screen (`config/user_filaments.json`) to Kalico with `_BOX_FILAMENT_SET`. Edits to system filaments stay a local HelixScreen override;
+- during a print it only reads Moonraker.
 
-HelixScreen reads the catalog every time a picker opens, so a change appears without a restart. Only its RFID-code lookup is cached: with `RESTART_HELIX=idle` (default) the service restarts HelixScreen once after a change, when the printer is idle.
-
-**From the screen to the host.** A filament created in HelixScreen goes to `config/user_filaments.json`. While the printer is idle the service sends it to Kalico:
-- with `_BOX_FILAMENT_SET ID=HXnnnn …`, then drops it from the overlay, because it comes back with the library;
-- an edit of one of your custom filaments is sent the same way, keeping its colour;
-- edits to read-only system filaments stay a local HelixScreen override.
-
-**During a print** the service only reads Moonraker: no G-code, no HelixScreen restart.
-
-**Settings** in `/mnt/UDISK/.k2openhost/k2openhost.conf`:
-- `HELIX_FILAMENTS=off` turns the service off;
-- `RESTART_HELIX=never` disables the restart.
-
-**Going back to the presets:**
+Settings in `/mnt/UDISK/.k2openhost/k2openhost.conf`: `HELIX_FILAMENTS=off` turns the service off, `RESTART_HELIX=never` disables the restart. To go back to the presets:
 
 ```sh
 /etc/init.d/k2oh-helix-filaments stop
