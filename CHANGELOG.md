@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **`k2oh-helix-filaments` retires with HelixScreen 1.0.6-k2oh.8 or later**, which reads Kalico's `box.filaments` itself and saves new filaments straight into Kalico. The init script runs `--retire` first: with that build installed (`release_info.json`) the shipped catalog is put back and the service does not start. A running service that sees the build arrive (in-app update) restores the catalog and idles, so it no longer restarts HelixScreen after a library change.
 - **HelixScreen replaced from a release archive** (`k2oh-setup helix-update <archive>`, `helix-restore`): only while the printer is idle (a host that does not answer counts as busy). The installed HelixScreen and its init scripts are saved to `helix-backup/<date>`, the release's own installer runs with `--update`, then the boot wait on the host's Moonraker and the disabled camera server are put back. `helix-restore` puts the last saved one back and moves the replaced one to `trash/`.
 - **Wi-Fi power save off** (`k2oh-wifi`): the T113 radio dozed with power save on, and HelixScreen's websocket to Moonraker on the external host dropped often (59 disconnects in 12 days on the reference printer, 17 with a stalled reconnect).
 - **HelixScreen lists only the host's filament library** (`k2oh-helix-filaments`, S98):
